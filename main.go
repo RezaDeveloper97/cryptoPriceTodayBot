@@ -7,9 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -148,60 +151,93 @@ func addThousandsSep(s string) string {
 	return b.String()
 }
 
-// منابع نرخ USD→IRR. اولی Cloudflare Pages است و دومی jsDelivr به‌عنوان fallback.
-// هر دو روی پروژه متن‌باز fawazahmed0/currency-api سوارند، بدون نیاز به کلید
-// و از خارج ایران بدون مشکل در دسترسند.
-var usdRateEndpoints = []string{
-	"https://latest.currency-api.pages.dev/v1/currencies/usd.json",
-	"https://cdn.jsdelivr.net/npm/@fawazahmed/currency-api@latest/v1/currencies/usd.json",
-}
+const bonbastUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-// fetchUSDInToman نرخ دلار به تومان را برمی‌گرداند. API بر حسب ریال جواب می‌دهد
-// (USD → IRR)، تقسیم بر ۱۰ آن را به تومان تبدیل می‌کند.
-func fetchUSDInToman(ctx context.Context, client *http.Client) (float64, error) {
-	var lastErr error
-	for _, endpoint := range usdRateEndpoints {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Accept", "application/json")
+// regex برای استخراج پارامتر CSRF از HTML صفحه اصلی bonbast
+// قالب: param: "TOKEN,CSRF,TIMESTAMP"
+var bonbastParamRe = regexp.MustCompile(`param:\s*"([^"]+)"`)
 
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-			resp.Body.Close()
-			lastErr = fmt.Errorf("کد وضعیت %d از %s: %s", resp.StatusCode, endpoint, string(body))
-			continue
-		}
-
-		var data struct {
-			USD map[string]float64 `json:"usd"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("پارس پاسخ نرخ ارز شکست خورد: %w", err)
-			continue
-		}
-		resp.Body.Close()
-
-		rial, ok := data.USD["irr"]
-		if !ok || rial <= 0 {
-			lastErr = fmt.Errorf("مقدار IRR در پاسخ نرخ ارز یافت نشد")
-			continue
-		}
-		return rial / 10, nil
+// fetchUSDInToman قیمت لحظه‌ای دلار آمریکا به تومان را از bonbast.com (بازار آزاد ایران)
+// می‌گیرد. روال: GET صفحه اصلی برای دریافت پارامتر CSRF و کوکی، سپس POST به /json.
+// مقدار usd1 (قیمت فروش) که bonbast به تومان برمی‌گرداند را پارس می‌کند.
+func fetchUSDInToman(ctx context.Context, baseClient *http.Client) (float64, error) {
+	// کوکی‌جار محلی برای هر فراخوانی، چون پارامتر صفحه و کوکی‌اش با هم گره خورده‌اند
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return 0, err
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("هیچ منبع نرخ ارزی پیکربندی نشده")
+	client := &http.Client{Timeout: baseClient.Timeout, Jar: jar}
+
+	homeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.bonbast.com/", nil)
+	if err != nil {
+		return 0, err
 	}
-	return 0, lastErr
+	homeReq.Header.Set("User-Agent", bonbastUserAgent)
+	homeReq.Header.Set("Accept", "text/html")
+
+	homeResp, err := client.Do(homeReq)
+	if err != nil {
+		return 0, fmt.Errorf("درخواست صفحه bonbast شکست خورد: %w", err)
+	}
+	defer homeResp.Body.Close()
+	if homeResp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("کد وضعیت bonbast %d", homeResp.StatusCode)
+	}
+	html, err := io.ReadAll(io.LimitReader(homeResp.Body, 1<<20))
+	if err != nil {
+		return 0, err
+	}
+
+	m := bonbastParamRe.FindSubmatch(html)
+	if len(m) < 2 {
+		return 0, fmt.Errorf("پارامتر bonbast در HTML پیدا نشد")
+	}
+	param := string(m[1])
+
+	form := url.Values{}
+	form.Set("param", param)
+	jsonReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://www.bonbast.com/json", strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, err
+	}
+	jsonReq.Header.Set("User-Agent", bonbastUserAgent)
+	jsonReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	jsonReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+	jsonReq.Header.Set("Referer", "https://www.bonbast.com/")
+	jsonReq.Header.Set("Origin", "https://www.bonbast.com")
+	jsonReq.Header.Set("Accept", "application/json")
+
+	jsonResp, err := client.Do(jsonReq)
+	if err != nil {
+		return 0, fmt.Errorf("درخواست JSON bonbast شکست خورد: %w", err)
+	}
+	defer jsonResp.Body.Close()
+	if jsonResp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("کد وضعیت bonbast/json %d", jsonResp.StatusCode)
+	}
+
+	var data map[string]any
+	if err := json.NewDecoder(jsonResp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("پارس JSON bonbast شکست خورد: %w", err)
+	}
+
+	if _, expired := data["reset"]; expired {
+		return 0, fmt.Errorf("نشست bonbast منقضی شد (reset=1)")
+	}
+
+	usdRaw, ok := data["usd1"]
+	if !ok {
+		return 0, fmt.Errorf("فیلد usd1 در پاسخ bonbast نبود")
+	}
+	usdStr, ok := usdRaw.(string)
+	if !ok {
+		return 0, fmt.Errorf("نوع usd1 در پاسخ bonbast غیرمنتظره: %T", usdRaw)
+	}
+	toman, err := strconv.ParseFloat(strings.ReplaceAll(usdStr, ",", ""), 64)
+	if err != nil {
+		return 0, fmt.Errorf("قیمت دلار bonbast نامعتبر: %w", err)
+	}
+	return toman, nil
 }
 
 // formatMessage پیام نهایی Markdown را می‌سازد
