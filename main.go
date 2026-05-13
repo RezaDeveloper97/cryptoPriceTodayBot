@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,19 +20,20 @@ import (
 type Coin struct {
 	ID     string // شناسه در CoinGecko
 	Symbol string // نماد بازار مثل BTC
-	Name   string // نام فارسی برای نمایش
+	Name   string // نام انگلیسی برای نمایش
+	Emoji  string // ایموجی نماد ارز
 }
 
 // لیست ارزهایی که می‌خواهیم رصد کنیم
 // برای اضافه کردن ارز جدید، id را از coingecko.com پیدا کنید
 var coins = []Coin{
-	{ID: "bitcoin", Symbol: "BTC", Name: "بیت‌کوین"},
-	{ID: "ethereum", Symbol: "ETH", Name: "اتریوم"},
-	{ID: "tether", Symbol: "USDT", Name: "تتر"},
-	{ID: "binancecoin", Symbol: "BNB", Name: "بایننس‌کوین"},
-	{ID: "ripple", Symbol: "XRP", Name: "ریپل"},
-	{ID: "solana", Symbol: "SOL", Name: "سولانا"},
-	{ID: "dogecoin", Symbol: "DOGE", Name: "دوج‌کوین"},
+	{ID: "bitcoin", Symbol: "BTC", Name: "Bitcoin", Emoji: "🟠"},
+	{ID: "ethereum", Symbol: "ETH", Name: "Ethereum", Emoji: "🔷"},
+	{ID: "tether", Symbol: "USDT", Name: "Tether", Emoji: "💵"},
+	{ID: "binancecoin", Symbol: "BNB", Name: "BNB", Emoji: "🟡"},
+	{ID: "ripple", Symbol: "XRP", Name: "Ripple", Emoji: "🔵"},
+	{ID: "solana", Symbol: "SOL", Name: "Solana", Emoji: "🟣"},
+	{ID: "dogecoin", Symbol: "DOGE", Name: "Dogecoin", Emoji: "🐕"},
 }
 
 type Config struct {
@@ -147,25 +149,75 @@ func addThousandsSep(s string) string {
 	return b.String()
 }
 
+// fetchUSDInToman قیمت دلار آمریکا به تومان را از Nobitex (نرخ USDT/IRT)
+// به‌عنوان معیار بازار آزاد ایران می‌گیرد. پاسخ Nobitex بر حسب ریال است؛
+// با تقسیم بر ۱۰ به تومان تبدیل می‌کنیم.
+func fetchUSDInToman(ctx context.Context, client *http.Client) (float64, error) {
+	const endpoint = "https://api.nobitex.ir/v2/orderbook/USDTIRT"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return 0, fmt.Errorf("کد وضعیت Nobitex %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data struct {
+		Status         string `json:"status"`
+		LastTradePrice string `json:"lastTradePrice"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("پارس پاسخ Nobitex شکست خورد: %w", err)
+	}
+	if data.LastTradePrice == "" {
+		return 0, fmt.Errorf("قیمت دلار از Nobitex دریافت نشد")
+	}
+	rial, err := strconv.ParseFloat(data.LastTradePrice, 64)
+	if err != nil {
+		return 0, fmt.Errorf("قیمت دلار نامعتبر: %w", err)
+	}
+	return rial / 10, nil
+}
+
 // formatMessage پیام نهایی Markdown را می‌سازد
-func formatMessage(prices map[string]priceInfo) string {
+func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 	var b strings.Builder
-	b.WriteString("💹 *قیمت لحظه‌ای ارزهای دیجیتال*\n\n")
+	b.WriteString("📊 *Live Crypto Prices*\n")
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n\n")
 
 	for _, c := range coins {
 		p, ok := prices[c.ID]
 		if !ok {
 			continue
 		}
-		arrow := "🟢"
+		sign := "🟢 ▲"
 		if p.Change24h < 0 {
-			arrow = "🔴"
+			sign = "🔴 ▼"
 		}
 		fmt.Fprintf(&b,
-			"%s *%s* (%s)\n💵 `$%s`  |  `%+.2f%%`\n\n",
-			arrow, c.Name, c.Symbol,
-			formatPrice(p.USD), p.Change24h,
+			"%s *%s* `%s`\n   `$%s`  %s `%+.2f%%`\n\n",
+			c.Emoji, c.Name, c.Symbol,
+			formatPrice(p.USD), sign, p.Change24h,
 		)
+	}
+
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	if usdToman > 0 {
+		fmt.Fprintf(&b,
+			"🇮🇷 *Iranian Rial* `IRR`\n   `1 USD ≈ %s Toman`\n\n",
+			addThousandsSep(fmt.Sprintf("%.0f", usdToman)),
+		)
+	} else {
+		b.WriteString("🇮🇷 *Iranian Rial* `IRR`\n   _unavailable_\n\n")
 	}
 
 	// زمان به وقت تهران
@@ -173,7 +225,10 @@ func formatMessage(prices map[string]priceInfo) string {
 	if err != nil {
 		loc = time.UTC
 	}
-	fmt.Fprintf(&b, "🕐 %s\n_منبع: CoinGecko_", time.Now().In(loc).Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b,
+		"🕐 %s (Tehran)\n_Sources: CoinGecko · Nobitex_",
+		time.Now().In(loc).Format("2006-01-02 15:04:05"),
+	)
 	return b.String()
 }
 
@@ -218,7 +273,14 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config) {
 		return
 	}
 
-	msg := formatMessage(prices)
+	// قیمت دلار اختیاری است؛ اگر شکست خورد پیام را بدون آن می‌فرستیم
+	usdToman, err := fetchUSDInToman(cycleCtx, client)
+	if err != nil {
+		log.Printf("⚠️ خطای دریافت قیمت دلار: %v", err)
+		usdToman = 0
+	}
+
+	msg := formatMessage(prices, usdToman)
 
 	if err := sendToTelegram(cycleCtx, client, cfg, msg); err != nil {
 		log.Printf("❌ خطای ارسال به تلگرام: %v", err)
