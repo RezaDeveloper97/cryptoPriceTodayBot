@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -149,43 +148,60 @@ func addThousandsSep(s string) string {
 	return b.String()
 }
 
-// fetchUSDInToman قیمت دلار آمریکا به تومان را از Nobitex (نرخ USDT/IRT)
-// به‌عنوان معیار بازار آزاد ایران می‌گیرد. پاسخ Nobitex بر حسب ریال است؛
-// با تقسیم بر ۱۰ به تومان تبدیل می‌کنیم.
+// منابع نرخ USD→IRR. اولی Cloudflare Pages است و دومی jsDelivr به‌عنوان fallback.
+// هر دو روی پروژه متن‌باز fawazahmed0/currency-api سوارند، بدون نیاز به کلید
+// و از خارج ایران بدون مشکل در دسترسند.
+var usdRateEndpoints = []string{
+	"https://latest.currency-api.pages.dev/v1/currencies/usd.json",
+	"https://cdn.jsdelivr.net/npm/@fawazahmed/currency-api@latest/v1/currencies/usd.json",
+}
+
+// fetchUSDInToman نرخ دلار به تومان را برمی‌گرداند. API بر حسب ریال جواب می‌دهد
+// (USD → IRR)، تقسیم بر ۱۰ آن را به تومان تبدیل می‌کند.
 func fetchUSDInToman(ctx context.Context, client *http.Client) (float64, error) {
-	const endpoint = "https://api.nobitex.ir/v2/orderbook/USDTIRT"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Accept", "application/json")
+	var lastErr error
+	for _, endpoint := range usdRateEndpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return 0, fmt.Errorf("کد وضعیت Nobitex %d: %s", resp.StatusCode, string(body))
-	}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+			resp.Body.Close()
+			lastErr = fmt.Errorf("کد وضعیت %d از %s: %s", resp.StatusCode, endpoint, string(body))
+			continue
+		}
 
-	var data struct {
-		Status         string `json:"status"`
-		LastTradePrice string `json:"lastTradePrice"`
+		var data struct {
+			USD map[string]float64 `json:"usd"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("پارس پاسخ نرخ ارز شکست خورد: %w", err)
+			continue
+		}
+		resp.Body.Close()
+
+		rial, ok := data.USD["irr"]
+		if !ok || rial <= 0 {
+			lastErr = fmt.Errorf("مقدار IRR در پاسخ نرخ ارز یافت نشد")
+			continue
+		}
+		return rial / 10, nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return 0, fmt.Errorf("پارس پاسخ Nobitex شکست خورد: %w", err)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("هیچ منبع نرخ ارزی پیکربندی نشده")
 	}
-	if data.LastTradePrice == "" {
-		return 0, fmt.Errorf("قیمت دلار از Nobitex دریافت نشد")
-	}
-	rial, err := strconv.ParseFloat(data.LastTradePrice, 64)
-	if err != nil {
-		return 0, fmt.Errorf("قیمت دلار نامعتبر: %w", err)
-	}
-	return rial / 10, nil
+	return 0, lastErr
 }
 
 // formatMessage پیام نهایی Markdown را می‌سازد
