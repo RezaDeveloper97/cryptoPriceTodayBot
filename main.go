@@ -30,6 +30,10 @@ type Coin struct {
 // برای اضافه کردن ارز جدید، id را از coingecko.com پیدا کنید
 var coins = []Coin{
 	{ID: "bitcoin", Symbol: "BTC", Name: "Bitcoin", Emoji: "🟠"},
+	{ID: "tether-gold", Symbol: "XAUT", Name: "Tether Gold", Emoji: "🥇"},
+	{ID: "pax-gold", Symbol: "PAXG", Name: "PAX Gold", Emoji: "🥇"},
+	{ID: "ishares-silver-trust-ondo-tokenized-stock", Symbol: "SLVON", Name: "iShares Silver", Emoji: "🥈"},
+	{ID: "wti-perp", Symbol: "WTI", Name: "WTI Crude Oil", Emoji: "🛢️"},
 	{ID: "ethereum", Symbol: "ETH", Name: "Ethereum", Emoji: "🔷"},
 	{ID: "tether", Symbol: "USDT", Name: "Tether", Emoji: "💵"},
 	{ID: "binancecoin", Symbol: "BNB", Name: "BNB", Emoji: "🟡"},
@@ -78,9 +82,12 @@ type priceInfo struct {
 
 // fetchPrices قیمت همه ارزها را با یک درخواست از CoinGecko می‌گیرد
 func fetchPrices(ctx context.Context, client *http.Client) (map[string]priceInfo, error) {
-	ids := make([]string, len(coins))
-	for i, c := range coins {
-		ids[i] = c.ID
+	ids := make([]string, 0, len(coins))
+	for _, c := range coins {
+		if c.ID == "wti-perp" {
+			continue // قیمت WTI از CoinGecko/derivatives گرفته می‌شود نه simple/price
+		}
+		ids = append(ids, c.ID)
 	}
 	endpoint := fmt.Sprintf(
 		"https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd&include_24hr_change=true",
@@ -109,6 +116,44 @@ func fetchPrices(ctx context.Context, client *http.Client) (map[string]priceInfo
 		return nil, fmt.Errorf("پارس پاسخ شکست خورد: %w", err)
 	}
 	return data, nil
+}
+
+// fetchWTIPerp قیمت قرارداد پرپچوال WTI را از Hyperliquid (از طریق CoinGecko) می‌گیرد.
+// WTI روی endpoint simple/price نیست چون یک قرارداد مشتقه است نه توکن اسپات.
+func fetchWTIPerp(ctx context.Context, client *http.Client) (priceInfo, error) {
+	const endpoint = "https://api.coingecko.com/api/v3/derivatives/exchanges/hyperliquid?include_tickers=all"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return priceInfo{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return priceInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return priceInfo{}, fmt.Errorf("کد وضعیت Hyperliquid %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data struct {
+		Tickers []struct {
+			Symbol string  `json:"symbol"`
+			Last   float64 `json:"last"`
+			H24    float64 `json:"h24_percentage_change"`
+		} `json:"tickers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return priceInfo{}, fmt.Errorf("پارس پاسخ Hyperliquid شکست خورد: %w", err)
+	}
+	for _, t := range data.Tickers {
+		if t.Symbol == "CASH:WTI-USD" {
+			return priceInfo{USD: t.Last, Change24h: t.H24}, nil
+		}
+	}
+	return priceInfo{}, fmt.Errorf("نماد CASH:WTI-USD در tickers پیدا نشد")
 }
 
 // formatPrice برای قیمت‌های بالای ۱ دلار دو رقم اعشار و برای ارزهای ارزان شش رقم
@@ -323,6 +368,13 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config) {
 	if err != nil {
 		log.Printf("❌ خطای دریافت قیمت: %v", err)
 		return
+	}
+
+	// قیمت WTI اختیاری است؛ اگر گرفته نشد فقط آن خط در پیام رد می‌شود
+	if wti, err := fetchWTIPerp(cycleCtx, client); err != nil {
+		log.Printf("⚠️ خطای دریافت قیمت WTI: %v", err)
+	} else {
+		prices["wti-perp"] = wti
 	}
 
 	// قیمت دلار اختیاری است؛ اگر شکست خورد پیام را بدون آن می‌فرستیم
