@@ -11,7 +11,6 @@ import (
 	"image/png"
 	"io"
 	"log"
-	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -64,13 +63,13 @@ var coinColors = map[string]color.RGBA{
 	"tether-gold": {212, 175, 55, 255},
 	"pax-gold":    {255, 193, 37, 255},
 	"ishares-silver-trust-ondo-tokenized-stock": {130, 130, 140, 255},
-	"wti-perp":     {51, 51, 51, 255},
-	"ethereum":     {98, 126, 234, 255},
-	"tether":       {38, 161, 123, 255},
-	"binancecoin":  {243, 186, 47, 255},
-	"ripple":       {35, 41, 47, 255},
-	"solana":       {153, 69, 255, 255},
-	"dogecoin":     {186, 160, 82, 255},
+	"wti-perp":    {51, 51, 51, 255},
+	"ethereum":    {98, 126, 234, 255},
+	"tether":      {38, 161, 123, 255},
+	"binancecoin": {243, 186, 47, 255},
+	"ripple":      {35, 41, 47, 255},
+	"solana":      {153, 69, 255, 255},
+	"dogecoin":    {186, 160, 82, 255},
 }
 
 type Config struct {
@@ -597,106 +596,91 @@ func textWidth(face xfont.Face, s string) int {
 
 // رنگ‌های تم تیره مشابه TradingView
 var (
-	bgDark      = color.RGBA{0x13, 0x17, 0x22, 0xFF}
-	bgCard      = color.RGBA{0x1E, 0x22, 0x2D, 0xFF}
-	textBright  = color.RGBA{0xE5, 0xE7, 0xEB, 0xFF}
-	textMuted   = color.RGBA{0x9C, 0xA3, 0xAF, 0xFF}
-	textDim     = color.RGBA{0x6B, 0x72, 0x80, 0xFF}
-	greenTV     = color.RGBA{0x26, 0xA6, 0x9A, 0xFF}
-	redTV       = color.RGBA{0xEF, 0x53, 0x50, 0xFF}
+	bgDark     = color.RGBA{0x13, 0x17, 0x22, 0xFF}
+	bgCard     = color.RGBA{0x1E, 0x22, 0x2D, 0xFF}
+	textBright = color.RGBA{0xE5, 0xE7, 0xEB, 0xFF}
+	textMuted  = color.RGBA{0x9C, 0xA3, 0xAF, 0xFF}
+	textDim    = color.RGBA{0x6B, 0x72, 0x80, 0xFF}
+	greenTV    = color.RGBA{0x26, 0xA6, 0x9A, 0xFF}
+	redTV      = color.RGBA{0xEF, 0x53, 0x50, 0xFF}
 )
 
-// quickChartDataset یک سری داده برای Chart.js
-type quickChartDataset struct {
-	Label           string    `json:"label"`
-	Data            []float64 `json:"data"`
-	BorderColor     string    `json:"borderColor"`
-	BackgroundColor string    `json:"backgroundColor"`
-	Tension         float64   `json:"tension"`
-	BorderWidth     float64   `json:"borderWidth"`
-	PointRadius     int       `json:"pointRadius"`
-	Fill            bool      `json:"fill"`
-	CubicInterpMode string    `json:"cubicInterpolationMode"`
-}
+// buildQuickChartReq درخواست POST برای QuickChart می‌سازد — نمودار میله‌ای
+// عمودی که برای هر ارز یک میله نشان می‌دهد: درصد تغییر قیمت از اولین نمونه
+// تا آخرین نمونه داخل پنجره. رنگ هر میله = رنگ همان ارز در coinColors.
+func buildQuickChartReq(snap []sample, minY, maxY float64) map[string]interface{} {
+	labels := []string{}
+	data := []float64{}
+	colors := []string{}
 
-// buildQuickChartReq کانفیگ POST برای QuickChart می‌سازد
-func buildQuickChartReq(snap []sample, xFormat string, minY, maxY float64) map[string]interface{} {
-	labels := make([]string, len(snap))
-	for i, s := range snap {
-		labels[i] = s.t.Format(xFormat)
-	}
-
-	datasets := []quickChartDataset{}
 	for _, c := range coins {
-		var base float64
-		ys := make([]float64, 0, len(snap))
+		var base, last float64
 		has := false
 		for _, s := range snap {
 			p, ok := s.prices[c.ID]
 			if !ok || p <= 0 {
-				ys = append(ys, math.NaN())
 				continue
 			}
-			if base == 0 {
+			if !has {
 				base = p
+				has = true
 			}
-			ys = append(ys, (p/base-1)*100)
-			has = true
+			last = p
 		}
-		if !has {
+		if !has || base == 0 {
 			continue
 		}
+		labels = append(labels, c.Symbol)
+		data = append(data, (last/base-1)*100)
 		col := coinColors[c.ID]
-		hex := fmt.Sprintf("#%02X%02X%02X", col.R, col.G, col.B)
-		datasets = append(datasets, quickChartDataset{
-			Label:           c.Symbol,
-			Data:            ys,
-			BorderColor:     hex,
-			BackgroundColor: "transparent",
-			Tension:         0.35,
-			BorderWidth:     5.0,
-			PointRadius:     0,
-			Fill:            false,
-			CubicInterpMode: "monotone",
-		})
+		colors = append(colors, fmt.Sprintf("#%02X%02X%02X", col.R, col.G, col.B))
+	}
+
+	dataset := map[string]interface{}{
+		"label":           "% Change",
+		"data":            data,
+		"backgroundColor": colors,
+		"borderColor":     colors,
+		"borderWidth":     0,
+		"borderRadius":    8,
 	}
 
 	cfg := map[string]interface{}{
-		"type": "line",
+		"type": "bar",
 		"data": map[string]interface{}{
 			"labels":   labels,
-			"datasets": datasets,
+			"datasets": []map[string]interface{}{dataset},
 		},
 		"options": map[string]interface{}{
 			"responsive":          false,
 			"maintainAspectRatio": false,
-			"interaction":         map[string]interface{}{"intersect": false},
+			"layout": map[string]interface{}{
+				"padding": map[string]interface{}{"top": 60, "right": 30, "left": 10, "bottom": 10},
+			},
 			"plugins": map[string]interface{}{
-				"legend": map[string]interface{}{
-					"position": "top",
-					"align":    "center",
-					"labels": map[string]interface{}{
-						"color":      "#E5E7EB",
-						"boxWidth":   36,
-						"boxHeight":  6,
-						"padding":    18,
-						"usePointStyle": false,
-						"font":       map[string]interface{}{"size": 26, "weight": "bold"},
-					},
+				"legend": map[string]interface{}{"display": false},
+				"title":  map[string]interface{}{"display": false},
+				// formatter به‌صورت placeholder رشته‌ای ست می‌شود و بعد از marshal
+				// با تابع JS واقعی جایگزین می‌شود (chart را به‌صورت رشته می‌فرستیم
+				// تا QuickChart بتواند تابع را اجرا کند).
+				"datalabels": map[string]interface{}{
+					"anchor":    "end",
+					"align":     "end",
+					"clip":      false,
+					"color":     "#E5E7EB",
+					"font":      map[string]interface{}{"size": 24, "weight": "bold"},
+					"formatter": "__FORMATTER__",
 				},
-				"title": map[string]interface{}{"display": false},
 			},
 			"scales": map[string]interface{}{
 				"x": map[string]interface{}{
 					"ticks": map[string]interface{}{
-						"color":         "#9CA3AF",
-						"maxRotation":   0,
-						"autoSkip":      true,
-						"maxTicksLimit": 8,
-						"padding":       8,
-						"font":          map[string]interface{}{"size": 22},
+						"color":   "#E5E7EB",
+						"padding": 8,
+						"font":    map[string]interface{}{"size": 26, "weight": "bold"},
 					},
-					"grid": map[string]interface{}{"color": "rgba(255,255,255,0.05)", "drawBorder": false},
+					"grid":   map[string]interface{}{"display": false},
+					"border": map[string]interface{}{"color": "rgba(255,255,255,0.15)"},
 				},
 				"y": map[string]interface{}{
 					"min": minY,
@@ -713,8 +697,16 @@ func buildQuickChartReq(snap []sample, xFormat string, minY, maxY float64) map[s
 		},
 	}
 
+	// chart را به‌صورت رشته JS (نه شیء JSON تو در تو) می‌فرستیم تا formatter
+	// به‌عنوان تابع واقعی JavaScript توسط QuickChart اجرا شود.
+	cfgBytes, _ := json.Marshal(cfg)
+	cfgStr := strings.Replace(string(cfgBytes),
+		`"__FORMATTER__"`,
+		`function(v){return (v>=0?'+':'')+v.toFixed(2)+'%';}`,
+		1)
+
 	return map[string]interface{}{
-		"chart":            cfg,
+		"chart":            cfgStr,
 		"width":            2560, // ۲x برای کرامیت — بعد در Go با CatmullRom scale می‌شود
 		"height":           1080,
 		"format":           "png",
@@ -772,57 +764,53 @@ func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, sn
 	subtitle := fmt.Sprintf("Window: %s   |   %s (Tehran)", windowLabel, now.In(tehran).Format("2006-01-02 15:04:05"))
 	drawText(canvas, width-30-textWidth(faceRegular, subtitle), 45, faceRegular, textMuted, subtitle)
 
-	// محاسبه min/max و فرمت محور X
-	minY, maxY := math.Inf(1), math.Inf(-1)
+	// برای نمودار میله‌ای، هر ارز یک مقدار دارد: درصد تغییر از اولین تا آخرین
+	// نمونه داخل پنجره. min/max را از همین مقادیر محاسبه می‌کنیم. صفر همیشه
+	// در محدوده هست تا میله‌ها پایه واضح داشته باشند.
+	minY, maxY := 0.0, 0.0
 	if len(snap) >= 2 {
 		for _, c := range coins {
-			var base float64
+			var base, last float64
+			has := false
 			for _, s := range snap {
 				p, ok := s.prices[c.ID]
 				if !ok || p <= 0 {
 					continue
 				}
-				if base == 0 {
+				if !has {
 					base = p
+					has = true
 				}
-				yv := (p/base - 1) * 100
-				if yv < minY {
-					minY = yv
-				}
-				if yv > maxY {
-					maxY = yv
-				}
+				last = p
+			}
+			if !has || base == 0 {
+				continue
+			}
+			yv := (last/base - 1) * 100
+			if yv < minY {
+				minY = yv
+			}
+			if yv > maxY {
+				maxY = yv
 			}
 		}
 	}
-	if math.IsInf(minY, 1) {
-		minY, maxY = -0.5, 0.5
+	// حداقل ±0.5% تا وقتی همه چیز نزدیک صفر است نمودار بیش از حد بزرگ‌نمایی نشود
+	if maxY < 0.5 {
+		maxY = 0.5
 	}
+	if minY > -0.5 {
+		minY = -0.5
+	}
+	// padding بالا و پایین برای جا دادن لیبل مقدار روی میله‌ها
 	span := maxY - minY
-	if span < 1.0 {
-		mid := (minY + maxY) / 2
-		minY = mid - 0.5
-		maxY = mid + 0.5
-	} else {
-		minY -= span * 0.1
-		maxY += span * 0.1
-	}
-
-	xFormat := "01-02 15:04"
-	if len(snap) >= 2 {
-		dur := snap[len(snap)-1].t.Sub(snap[0].t)
-		switch {
-		case dur < 10*time.Minute:
-			xFormat = "15:04:05"
-		case dur < 24*time.Hour:
-			xFormat = "15:04"
-		}
-	}
+	maxY += span * 0.12
+	minY -= span * 0.08
 
 	chartImgRect := image.Rect(0, chartTop, width, chartTop+chartH)
 
 	if len(snap) >= 2 {
-		qcReq := buildQuickChartReq(snap, xFormat, minY, maxY)
+		qcReq := buildQuickChartReq(snap, minY, maxY)
 		pngBytes, err := fetchQuickChartPNG(ctx, client, baseURL, qcReq)
 		if err != nil {
 			return nil, fmt.Errorf("رندر QuickChart: %w", err)

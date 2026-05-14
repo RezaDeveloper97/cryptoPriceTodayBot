@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a multi-line price chart (one color per coin) as a TradingView-styled dark PNG and posts it on a separate, configurable ticker via `sendPhoto`. Chart rendering uses **QuickChart** (https://quickchart.io — POST JSON, get PNG; free tier 60 req/min, or self-host with `ianw/quickchart` Docker image). Go-side dependency: `golang.org/x/image` (font drawing + high-quality bilinear scaling). Everything else is stdlib.
+Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a **vertical bar chart** of percent price change per coin (one bar per coin, colored to match `coinColors`, value labeled above the bar) as a TradingView-styled dark PNG, and posts it on a separate, configurable ticker via `sendPhoto`. Chart rendering uses **QuickChart** (https://quickchart.io — POST JSON, get PNG; free tier 60 req/min, or self-host with `ianw/quickchart` Docker image). Go-side dependency: `golang.org/x/image` (font drawing + high-quality bilinear scaling). Everything else is stdlib.
 
 ## Commands
 
@@ -24,7 +24,7 @@ Optional `INTERVAL` env var accepts any `time.ParseDuration` value (default `1m`
 
 Chart envs:
 - `CHART_INTERVAL` (default `5m`) — how often the chart image is posted.
-- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Y-axis = percentage change from the first sample inside the window (clamped to a minimum span of ±0.5% to avoid stretched-looking flat periods).
+- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Each bar height = percentage change from the first to the last sample inside the window for that coin (clamped to a minimum range of ±0.5% to avoid stretched-looking flat periods).
 - `SAMPLE_INTERVAL` (default `20s`) — independent sampling cadence that feeds the chart history. Decoupled from the text ticker so the chart stays smooth even with a long `INTERVAL`.
 - `QUICKCHART_URL` (default `https://quickchart.io`) — base URL of QuickChart. Override to point at a self-hosted instance.
 
@@ -41,6 +41,8 @@ The `history` struct (mutex-protected `[]sample`) is the single source of shared
 `fetchPrices` makes one batched CoinGecko `/simple/price` request for all coin IDs in the package-level `coins` slice. `fetchWTIPerp` hits the Hyperliquid derivatives endpoint separately. `fetchUSDInToman` scrapes bonbast.com (two-step CSRF dance — see `bonbastParamRe`).
 
 `renderChartPNG` requests a 2560×1080 PNG from QuickChart with `devicePixelRatio=1`, then scales it down to 1280×540 with `xdraw.CatmullRom.Scale` for crispness. Fonts inside the chart config are sized at ~22–26 pt so they remain readable after the down-scale.
+
+`buildQuickChartReq` sends the chart config as a **JavaScript object literal string** (not a nested JSON object) so the `chartjs-plugin-datalabels` `formatter` can be a real JS function that prints `+1.23%` / `-0.45%` above each bar. A placeholder string `"__FORMATTER__"` is substituted with the JS function after `json.Marshal`; QuickChart parses the resulting string as JS.
 
 ### Adding a coin
 
