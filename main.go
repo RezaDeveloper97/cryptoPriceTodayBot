@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -80,6 +81,7 @@ type Config struct {
 	ChartInterval  time.Duration // فاصله ارسال عکس نمودار - پیش‌فرض ۵ دقیقه
 	ChartWindowDur time.Duration // پنجره نمایش روی نمودار. 0 یعنی session
 	ChartWindowRaw string        // مقدار خام برای نمایش روی عکس
+	SampleInterval time.Duration // فاصله نمونه‌گیری مستقل از تیکر متن - پیش‌فرض 20s
 }
 
 func loadConfig() (*Config, error) {
@@ -123,6 +125,15 @@ func loadConfig() (*Config, error) {
 		windowDur = d
 	}
 
+	sampleInterval := 20 * time.Second
+	if v := os.Getenv("SAMPLE_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("مقدار SAMPLE_INTERVAL نامعتبر است: %w", err)
+		}
+		sampleInterval = d
+	}
+
 	return &Config{
 		BotToken:       token,
 		ChannelID:      channel,
@@ -130,6 +141,7 @@ func loadConfig() (*Config, error) {
 		ChartInterval:  chartInterval,
 		ChartWindowDur: windowDur,
 		ChartWindowRaw: windowRaw,
+		SampleInterval: sampleInterval,
 	}, nil
 }
 
@@ -608,9 +620,8 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 
 	// تولید نمودار با go-chart
 	series := []chart.Series{}
+	minY, maxY := math.Inf(1), math.Inf(-1)
 	if len(snap) >= 2 {
-		// زمان مرجع = اولین نمونه
-		t0 := snap[0].t
 		for _, c := range coins {
 			// قیمت پایه (اولین قیمت غیرصفر این ارز در snap)
 			var base float64
@@ -624,8 +635,15 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 				if base == 0 {
 					base = p
 				}
+				yv := (p/base - 1) * 100
 				xs = append(xs, s.t)
-				ys = append(ys, (p/base-1)*100)
+				ys = append(ys, yv)
+				if yv < minY {
+					minY = yv
+				}
+				if yv > maxY {
+					maxY = yv
+				}
 			}
 			if len(xs) < 2 {
 				continue
@@ -637,11 +655,37 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 				YValues: ys,
 				Style: chart.Style{
 					StrokeColor: drawing.Color{R: col.R, G: col.G, B: col.B, A: 0xFF},
-					StrokeWidth: 2.2,
+					StrokeWidth: 2.8,
 				},
 			})
 		}
-		_ = t0
+	}
+
+	// محاسبه محدوده Y با حداقل ±0.5% تا وقتی تغییرات کوچک‌اند چارت کشیده نشود
+	if math.IsInf(minY, 1) {
+		minY, maxY = -0.5, 0.5
+	}
+	span := maxY - minY
+	if span < 1.0 {
+		mid := (minY + maxY) / 2
+		minY = mid - 0.5
+		maxY = mid + 0.5
+	} else {
+		// padding ۱۰٪
+		minY -= span * 0.1
+		maxY += span * 0.1
+	}
+
+	// تشخیص فرمت محور X بر اساس بازه زمانی
+	xFormat := "01-02 15:04"
+	if len(snap) >= 2 {
+		dur := snap[len(snap)-1].t.Sub(snap[0].t)
+		switch {
+		case dur < 10*time.Minute:
+			xFormat = "15:04:05"
+		case dur < 24*time.Hour:
+			xFormat = "15:04"
+		}
 	}
 
 	chartImgRect := image.Rect(0, chartTop, width, chartTop+chartH)
@@ -661,16 +705,17 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 				Style: chart.Style{FontSize: 11},
 				ValueFormatter: func(v interface{}) string {
 					if t, ok := v.(float64); ok {
-						return time.Unix(0, int64(t)).Format("01-02 15:04")
+						return time.Unix(0, int64(t)).Format(xFormat)
 					}
 					if tt, ok := v.(time.Time); ok {
-						return tt.Format("01-02 15:04")
+						return tt.Format(xFormat)
 					}
 					return ""
 				},
 			},
 			YAxis: chart.YAxis{
 				Style: chart.Style{FontSize: 11},
+				Range: &chart.ContinuousRange{Min: minY, Max: maxY},
 				ValueFormatter: func(v interface{}) string {
 					if f, ok := v.(float64); ok {
 						return fmt.Sprintf("%+.2f%%", f)
@@ -883,11 +928,36 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("🚀 ربات شروع به کار کرد — بازه متن: %s — بازه نمودار: %s — پنجره نمودار: %s — کانال: %s",
-		cfg.Interval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
+	log.Printf("🚀 ربات شروع به کار کرد — بازه متن: %s — نمونه‌گیری: %s — بازه نمودار: %s — پنجره: %s — کانال: %s",
+		cfg.Interval, cfg.SampleInterval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
 
 	// اولین چرخه متن را بلافاصله بفرست (هم history را پر می‌کند هم پیام را)
 	runCycle(ctx, client, cfg, hist)
+
+	// goroutine مستقل برای نمونه‌گیری سریع (بدون ارسال) — تا نمودار داده کافی داشته باشد
+	go func() {
+		tk := time.NewTicker(cfg.SampleInterval)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				sampleCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				prices, err := fetchPrices(sampleCtx, client)
+				if err != nil {
+					log.Printf("⚠️ نمونه‌گیری شکست خورد: %v", err)
+					cancel()
+					continue
+				}
+				if wti, werr := fetchWTIPerp(sampleCtx, client); werr == nil {
+					prices["wti-perp"] = wti
+				}
+				recordSample(hist, prices)
+				cancel()
+			}
+		}
+	}()
 
 	// goroutine جدا برای ارسال عکس نمودار
 	go func() {
