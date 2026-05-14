@@ -1,21 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/wcharczuk/go-chart/v2"
+	"github.com/wcharczuk/go-chart/v2/drawing"
+	xfont "golang.org/x/image/font"
+	"golang.org/x/image/font/gofont/gobold"
+	"golang.org/x/image/font/gofont/goregular"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/math/fixed"
 )
 
 // Coin یک ارز دیجیتال در CoinGecko را توصیف می‌کند
@@ -42,10 +58,28 @@ var coins = []Coin{
 	{ID: "dogecoin", Symbol: "DOGE", Name: "Dogecoin", Emoji: "🐕"},
 }
 
+// پالت رنگ هر ارز برای استفاده هم در خطوط نمودار و هم در مربع کنار قیمت‌ها
+var coinColors = map[string]color.RGBA{
+	"bitcoin":     {247, 147, 26, 255},
+	"tether-gold": {212, 175, 55, 255},
+	"pax-gold":    {255, 193, 37, 255},
+	"ishares-silver-trust-ondo-tokenized-stock": {130, 130, 140, 255},
+	"wti-perp":     {51, 51, 51, 255},
+	"ethereum":     {98, 126, 234, 255},
+	"tether":       {38, 161, 123, 255},
+	"binancecoin":  {243, 186, 47, 255},
+	"ripple":       {35, 41, 47, 255},
+	"solana":       {153, 69, 255, 255},
+	"dogecoin":     {186, 160, 82, 255},
+}
+
 type Config struct {
-	BotToken  string        // توکن گرفته شده از BotFather
-	ChannelID string        // @yourchannel یا -100xxxxxxxxx
-	Interval  time.Duration // فاصله ارسال - پیش‌فرض 1 دقیقه
+	BotToken       string        // توکن گرفته شده از BotFather
+	ChannelID      string        // @yourchannel یا -100xxxxxxxxx
+	Interval       time.Duration // فاصله ارسال پیام متنی - پیش‌فرض ۱ دقیقه
+	ChartInterval  time.Duration // فاصله ارسال عکس نمودار - پیش‌فرض ۵ دقیقه
+	ChartWindowDur time.Duration // پنجره نمایش روی نمودار. 0 یعنی session
+	ChartWindowRaw string        // مقدار خام برای نمایش روی عکس
 }
 
 func loadConfig() (*Config, error) {
@@ -67,10 +101,35 @@ func loadConfig() (*Config, error) {
 		interval = d
 	}
 
+	chartInterval := 5 * time.Minute
+	if v := os.Getenv("CHART_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("مقدار CHART_INTERVAL نامعتبر است: %w", err)
+		}
+		chartInterval = d
+	}
+
+	windowRaw := os.Getenv("CHART_WINDOW")
+	if windowRaw == "" {
+		windowRaw = "session"
+	}
+	var windowDur time.Duration
+	if windowRaw != "session" {
+		d, err := time.ParseDuration(windowRaw)
+		if err != nil {
+			return nil, fmt.Errorf("مقدار CHART_WINDOW نامعتبر است (یا session یا مثل 15m/1h/24h): %w", err)
+		}
+		windowDur = d
+	}
+
 	return &Config{
-		BotToken:  token,
-		ChannelID: channel,
-		Interval:  interval,
+		BotToken:       token,
+		ChannelID:      channel,
+		Interval:       interval,
+		ChartInterval:  chartInterval,
+		ChartWindowDur: windowDur,
+		ChartWindowRaw: windowRaw,
 	}, nil
 }
 
@@ -358,8 +417,370 @@ func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text 
 	return nil
 }
 
-// runCycle یک چرخه کامل: دریافت قیمت + ارسال به کانال
-func runCycle(ctx context.Context, client *http.Client, cfg *Config) {
+// sendPhoto یک عکس PNG را به کانال تلگرام به‌صورت multipart می‌فرستد
+func sendPhoto(ctx context.Context, client *http.Client, cfg *Config, pngBytes []byte, caption string) error {
+	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", cfg.BotToken)
+
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	_ = w.WriteField("chat_id", cfg.ChannelID)
+	if caption != "" {
+		_ = w.WriteField("caption", caption)
+		_ = w.WriteField("parse_mode", "Markdown")
+	}
+	part, err := w.CreateFormFile("photo", "chart.png")
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(pngBytes); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("تلگرام (sendPhoto) کد %d برگرداند: %s", resp.StatusCode, string(buf))
+	}
+	return nil
+}
+
+// sample یک نمونه از قیمت‌های همه ارزها در یک لحظه
+type sample struct {
+	t      time.Time
+	prices map[string]float64 // coin ID -> USD
+}
+
+// history بافر ایمن از thread برای نگه‌داری نمونه‌های قیمت
+type history struct {
+	mu      sync.Mutex
+	samples []sample
+	maxAge  time.Duration // 0 یعنی نامحدود (حالت session)
+}
+
+func (h *history) add(s sample) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.samples = append(h.samples, s)
+	if h.maxAge > 0 {
+		// نمونه‌های قدیمی‌تر از 2*maxAge پاک می‌شوند تا حافظه کنترل شود
+		cutoff := s.t.Add(-2 * h.maxAge)
+		idx := 0
+		for i, x := range h.samples {
+			if x.t.After(cutoff) {
+				idx = i
+				break
+			}
+		}
+		if idx > 0 {
+			h.samples = append([]sample(nil), h.samples[idx:]...)
+		}
+	}
+}
+
+// snapshot یک کپی از نمونه‌های داخل پنجره برمی‌گرداند. win=0 یعنی همه.
+func (h *history) snapshot(win time.Duration) []sample {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.samples) == 0 {
+		return nil
+	}
+	if win <= 0 {
+		out := make([]sample, len(h.samples))
+		copy(out, h.samples)
+		return out
+	}
+	cutoff := time.Now().Add(-win)
+	start := 0
+	for i, x := range h.samples {
+		if !x.t.Before(cutoff) {
+			start = i
+			break
+		}
+		start = i + 1
+	}
+	if start >= len(h.samples) {
+		return nil
+	}
+	out := make([]sample, len(h.samples)-start)
+	copy(out, h.samples[start:])
+	return out
+}
+
+// recordSample نمونه فعلی را در history ذخیره می‌کند
+func recordSample(h *history, prices map[string]priceInfo) {
+	if len(prices) == 0 {
+		return
+	}
+	ps := make(map[string]float64, len(prices))
+	for id, p := range prices {
+		ps[id] = p.USD
+	}
+	h.add(sample{t: time.Now(), prices: ps})
+}
+
+// فونت‌های بارگذاری‌شده برای ترکیب تصویر نهایی
+var (
+	faceRegular xfont.Face
+	faceBold    xfont.Face
+	faceTitle   xfont.Face
+)
+
+func init() {
+	reg, err := opentype.Parse(goregular.TTF)
+	if err != nil {
+		panic(err)
+	}
+	bold, err := opentype.Parse(gobold.TTF)
+	if err != nil {
+		panic(err)
+	}
+	faceRegular, err = opentype.NewFace(reg, &opentype.FaceOptions{Size: 18, DPI: 96, Hinting: xfont.HintingFull})
+	if err != nil {
+		panic(err)
+	}
+	faceBold, err = opentype.NewFace(bold, &opentype.FaceOptions{Size: 20, DPI: 96, Hinting: xfont.HintingFull})
+	if err != nil {
+		panic(err)
+	}
+	faceTitle, err = opentype.NewFace(bold, &opentype.FaceOptions{Size: 28, DPI: 96, Hinting: xfont.HintingFull})
+	if err != nil {
+		panic(err)
+	}
+}
+
+func drawText(img *image.RGBA, x, y int, face xfont.Face, c color.Color, s string) {
+	d := &xfont.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(c),
+		Face: face,
+		Dot:  fixed.P(x, y),
+	}
+	d.DrawString(s)
+}
+
+func textWidth(face xfont.Face, s string) int {
+	d := &xfont.Drawer{Face: face}
+	return d.MeasureString(s).Round()
+}
+
+// renderChartPNG تصویر نهایی PNG را می‌سازد: نمودار + لیست قیمت + نرخ دلار
+func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float64, windowLabel string, now time.Time) ([]byte, error) {
+	const (
+		width      = 1280
+		height     = 960
+		chartH     = 540
+		chartTop   = 70
+		pricesTop  = chartTop + chartH + 20
+		footerTop  = height - 50
+		bgColor    = 0xFAFAFA
+		titleColor = 0x1A1A1A
+	)
+
+	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
+	// پس‌زمینه روشن
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{0xFA, 0xFA, 0xFA, 0xFF}}, image.Point{}, draw.Src)
+	_ = bgColor
+	_ = titleColor
+
+	// عنوان بالا (بدون ایموجی چون فونت Go گلیف ایموجی ندارد)
+	title := "Crypto Market — % Change"
+	drawText(canvas, 30, 45, faceTitle, color.RGBA{0x1A, 0x1A, 0x1A, 0xFF}, title)
+	tehran, err := time.LoadLocation("Asia/Tehran")
+	if err != nil {
+		tehran = time.UTC
+	}
+	subtitle := fmt.Sprintf("Window: %s   |   %s (Tehran)", windowLabel, now.In(tehran).Format("2006-01-02 15:04:05"))
+	drawText(canvas, width-30-textWidth(faceRegular, subtitle), 45, faceRegular, color.RGBA{0x55, 0x55, 0x55, 0xFF}, subtitle)
+
+	// تولید نمودار با go-chart
+	series := []chart.Series{}
+	if len(snap) >= 2 {
+		// زمان مرجع = اولین نمونه
+		t0 := snap[0].t
+		for _, c := range coins {
+			// قیمت پایه (اولین قیمت غیرصفر این ارز در snap)
+			var base float64
+			var xs []time.Time
+			var ys []float64
+			for _, s := range snap {
+				p, ok := s.prices[c.ID]
+				if !ok || p <= 0 {
+					continue
+				}
+				if base == 0 {
+					base = p
+				}
+				xs = append(xs, s.t)
+				ys = append(ys, (p/base-1)*100)
+			}
+			if len(xs) < 2 {
+				continue
+			}
+			col := coinColors[c.ID]
+			series = append(series, chart.TimeSeries{
+				Name:    c.Symbol,
+				XValues: xs,
+				YValues: ys,
+				Style: chart.Style{
+					StrokeColor: drawing.Color{R: col.R, G: col.G, B: col.B, A: 0xFF},
+					StrokeWidth: 2.2,
+				},
+			})
+		}
+		_ = t0
+	}
+
+	chartImgRect := image.Rect(0, chartTop, width, chartTop+chartH)
+
+	if len(series) >= 1 {
+		graph := chart.Chart{
+			Width:  width,
+			Height: chartH,
+			Background: chart.Style{
+				FillColor: drawing.Color{R: 0xFA, G: 0xFA, B: 0xFA, A: 0xFF},
+				Padding:   chart.Box{Top: 10, Left: 20, Right: 30, Bottom: 10},
+			},
+			Canvas: chart.Style{
+				FillColor: drawing.Color{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF},
+			},
+			XAxis: chart.XAxis{
+				Style: chart.Style{FontSize: 11},
+				ValueFormatter: func(v interface{}) string {
+					if t, ok := v.(float64); ok {
+						return time.Unix(0, int64(t)).Format("01-02 15:04")
+					}
+					if tt, ok := v.(time.Time); ok {
+						return tt.Format("01-02 15:04")
+					}
+					return ""
+				},
+			},
+			YAxis: chart.YAxis{
+				Style: chart.Style{FontSize: 11},
+				ValueFormatter: func(v interface{}) string {
+					if f, ok := v.(float64); ok {
+						return fmt.Sprintf("%+.2f%%", f)
+					}
+					return ""
+				},
+			},
+			Series: series,
+		}
+		graph.Elements = []chart.Renderable{chart.LegendLeft(&graph)}
+
+		var buf bytes.Buffer
+		if err := graph.Render(chart.PNG, &buf); err != nil {
+			return nil, fmt.Errorf("رندر نمودار شکست خورد: %w", err)
+		}
+		chartImg, err := png.Decode(&buf)
+		if err != nil {
+			return nil, fmt.Errorf("decode نمودار شکست خورد: %w", err)
+		}
+		draw.Draw(canvas, chartImgRect, chartImg, chartImg.Bounds().Min, draw.Over)
+	} else {
+		// نمودار هنوز داده کافی ندارد
+		drawText(canvas, width/2-120, chartTop+chartH/2, faceBold, color.RGBA{0x88, 0x88, 0x88, 0xFF},
+			"در حال جمع‌آوری داده برای نمودار...")
+	}
+
+	// قیمت‌های زیر نمودار — دو ستون
+	type row struct {
+		coin   Coin
+		price  float64
+		change float64
+		ok     bool
+	}
+	rows := make([]row, 0, len(coins))
+	for _, c := range coins {
+		p, ok := current[c.ID]
+		rows = append(rows, row{coin: c, price: p.USD, change: p.Change24h, ok: ok})
+	}
+	// مرتب کن: ابتدا موجودها (با حجم بازار تقریبی)، سپس ناموجودها
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].ok != rows[j].ok {
+			return rows[i].ok
+		}
+		return rows[i].price > rows[j].price
+	})
+
+	colCount := 2
+	rowsPerCol := (len(rows) + colCount - 1) / colCount
+	colW := (width - 60) / colCount
+	rowH := 32
+
+	for i, r := range rows {
+		col := i / rowsPerCol
+		rowIdx := i % rowsPerCol
+		x := 30 + col*colW
+		y := pricesTop + rowIdx*rowH
+
+		swatch := coinColors[r.coin.ID]
+		// مربع رنگی
+		draw.Draw(canvas,
+			image.Rect(x, y-14, x+16, y+2),
+			&image.Uniform{C: swatch},
+			image.Point{}, draw.Src)
+
+		// نماد
+		drawText(canvas, x+26, y, faceBold, color.RGBA{0x1A, 0x1A, 0x1A, 0xFF}, r.coin.Symbol)
+
+		// قیمت
+		var priceStr string
+		if r.ok {
+			priceStr = "$" + formatPrice(r.price)
+		} else {
+			priceStr = "n/a"
+		}
+		drawText(canvas, x+135, y, faceRegular, color.RGBA{0x22, 0x22, 0x22, 0xFF}, priceStr)
+
+		// تغییر 24 ساعته
+		if r.ok {
+			changeStr := fmt.Sprintf("%+.2f%%", r.change)
+			cc := color.RGBA{0x16, 0xa3, 0x4a, 0xFF}
+			if r.change < 0 {
+				cc = color.RGBA{0xdc, 0x26, 0x26, 0xFF}
+			}
+			drawText(canvas, x+colW-110, y, faceRegular, cc, changeStr)
+		}
+	}
+
+	// فوتر: نرخ دلار و منابع
+	var footer string
+	if usdToman > 0 {
+		footer = fmt.Sprintf("IRR   1 USD  ≈  %s Toman", addThousandsSep(fmt.Sprintf("%.0f", usdToman)))
+	} else {
+		footer = "IRR   USD → Toman: unavailable"
+	}
+	fw := textWidth(faceBold, footer)
+	drawText(canvas, (width-fw)/2, footerTop, faceBold, color.RGBA{0x1A, 0x1A, 0x1A, 0xFF}, footer)
+
+	credit := "Sources: CoinGecko · Hyperliquid · Bonbast"
+	cw := textWidth(faceRegular, credit)
+	drawText(canvas, (width-cw)/2, footerTop+26, faceRegular, color.RGBA{0x77, 0x77, 0x77, 0xFF}, credit)
+
+	var out bytes.Buffer
+	if err := png.Encode(&out, canvas); err != nil {
+		return nil, fmt.Errorf("encode PNG شکست خورد: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+// runCycle یک چرخه کامل: دریافت قیمت + ارسال پیام متنی + ثبت در history
+func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history) {
 	// timeout مستقل برای هر چرخه تا اگر شبکه کند بود، چرخه بعدی قفل نشود
 	cycleCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -376,6 +797,9 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config) {
 	} else {
 		prices["wti-perp"] = wti
 	}
+
+	// ثبت نمونه در history برای استفاده در نمودار
+	recordSample(hist, prices)
 
 	// قیمت دلار اختیاری است؛ اگر شکست خورد پیام را بدون آن می‌فرستیم
 	usdToman, err := fetchUSDInToman(cycleCtx, client)
@@ -394,6 +818,58 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config) {
 	log.Printf("✅ پیام ارسال شد - تعداد ارز: %d", len(prices))
 }
 
+// runChartCycle یک چرخه: گرفتن قیمت دلار + رندر نمودار + ارسال عکس
+func runChartCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history) {
+	cycleCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	snap := hist.snapshot(cfg.ChartWindowDur)
+	if len(snap) < 2 {
+		log.Printf("ℹ️ داده کافی برای نمودار جمع نشده (%d نمونه) — صبر می‌کنیم", len(snap))
+		return
+	}
+
+	// قیمت‌های فعلی برای لیست زیر نمودار از آخرین نمونه
+	last := snap[len(snap)-1]
+	current := make(map[string]priceInfo, len(last.prices))
+	for id, p := range last.prices {
+		current[id] = priceInfo{USD: p}
+	}
+	// 24h change از یک fetch تازه (اختیاری — اگر شکست خورد فقط درصد را نشان نمی‌دهیم)
+	if fresh, err := fetchPrices(cycleCtx, client); err == nil {
+		if wti, werr := fetchWTIPerp(cycleCtx, client); werr == nil {
+			fresh["wti-perp"] = wti
+		}
+		for id, p := range fresh {
+			cur := current[id]
+			cur.Change24h = p.Change24h
+			if cur.USD == 0 {
+				cur.USD = p.USD
+			}
+			current[id] = cur
+		}
+	}
+
+	usdToman, err := fetchUSDInToman(cycleCtx, client)
+	if err != nil {
+		log.Printf("⚠️ خطای دریافت دلار برای نمودار: %v", err)
+		usdToman = 0
+	}
+
+	pngBytes, err := renderChartPNG(snap, current, usdToman, cfg.ChartWindowRaw, time.Now())
+	if err != nil {
+		log.Printf("❌ خطای ساخت نمودار: %v", err)
+		return
+	}
+
+	caption := fmt.Sprintf("📈 *Crypto Chart* — `%s` window", cfg.ChartWindowRaw)
+	if err := sendPhoto(cycleCtx, client, cfg, pngBytes, caption); err != nil {
+		log.Printf("❌ خطای ارسال عکس نمودار: %v", err)
+		return
+	}
+	log.Printf("🖼️ نمودار ارسال شد — %d نمونه در پنجره", len(snap))
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -401,15 +877,31 @@ func main() {
 	}
 
 	client := &http.Client{Timeout: 20 * time.Second}
+	hist := &history{maxAge: cfg.ChartWindowDur}
 
 	// graceful shutdown با Ctrl+C یا SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("🚀 ربات شروع به کار کرد - بازه ارسال: %s - کانال: %s", cfg.Interval, cfg.ChannelID)
+	log.Printf("🚀 ربات شروع به کار کرد — بازه متن: %s — بازه نمودار: %s — پنجره نمودار: %s — کانال: %s",
+		cfg.Interval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
 
-	// اولین پیام را بلافاصله بفرست (بدون انتظار برای ticker)
-	runCycle(ctx, client, cfg)
+	// اولین چرخه متن را بلافاصله بفرست (هم history را پر می‌کند هم پیام را)
+	runCycle(ctx, client, cfg, hist)
+
+	// goroutine جدا برای ارسال عکس نمودار
+	go func() {
+		tk := time.NewTicker(cfg.ChartInterval)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				runChartCycle(ctx, client, cfg, hist)
+			}
+		}
+	}()
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -420,7 +912,7 @@ func main() {
 			log.Println("🛑 سیگنال خاتمه دریافت شد، خروج تمیز...")
 			return
 		case <-ticker.C:
-			runCycle(ctx, client, cfg)
+			runCycle(ctx, client, cfg, hist)
 		}
 	}
 }

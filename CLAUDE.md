@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Uses only the Go standard library — no third-party dependencies (`go.mod` has no `require` block).
+Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a multi-line price chart (one color per coin) as a PNG and posts it on a separate, configurable ticker via `sendPhoto`. Depends on `github.com/wcharczuk/go-chart/v2` (chart rendering) and `golang.org/x/image` (font drawing) — everything else is stdlib.
 
 ## Commands
 
@@ -21,6 +21,10 @@ go vet ./...
 ```
 
 Optional `INTERVAL` env var accepts any `time.ParseDuration` value (default `1m`).
+
+Chart envs:
+- `CHART_INTERVAL` (default `5m`) — how often the chart image is posted.
+- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Y-axis = percentage change from the first sample inside the window.
 
 ## Architecture
 
