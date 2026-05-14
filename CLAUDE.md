@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a **vertical bar chart** of percent price change per coin (one bar per coin, colored to match `coinColors`, value labeled above the bar) as a TradingView-styled dark PNG, and posts it on a separate, configurable ticker via `sendPhoto`. Chart rendering uses **QuickChart** (https://quickchart.io — POST JSON, get PNG; free tier 60 req/min, or self-host with `ianw/quickchart` Docker image). Go-side dependency: `golang.org/x/image` (font drawing + high-quality bilinear scaling). Everything else is stdlib.
+Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a **vertical bar chart of current USD prices** (one bar per coin, sorted most-expensive to cheapest, colored to match `coinColors`, dollar value labeled above each bar) as a TradingView-styled dark PNG, and posts it on a separate, configurable ticker via `sendPhoto`. Y-axis is positive-only, starting at 0; ticks use compact USD notation (`$100K`, `$2.5K`, …). Chart rendering uses **QuickChart** (https://quickchart.io — POST JSON, get PNG; free tier 60 req/min, or self-host with `ianw/quickchart` Docker image). Go-side dependency: `golang.org/x/image` (font drawing + high-quality bilinear scaling). Everything else is stdlib.
 
 ## Commands
 
@@ -24,7 +24,7 @@ Optional `INTERVAL` env var accepts any `time.ParseDuration` value (default `1m`
 
 Chart envs:
 - `CHART_INTERVAL` (default `5m`) — how often the chart image is posted.
-- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Each bar height = percentage change from the first to the last sample inside the window for that coin (clamped to a minimum range of ±0.5% to avoid stretched-looking flat periods).
+- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Bar heights come from the **latest** sample in the window (the current USD price of each coin); the window mainly controls how stale `current` is allowed to be. Y-axis max = `1.15 × max(price)` to leave headroom for the value label above the tallest bar.
 - `SAMPLE_INTERVAL` (default `20s`) — independent sampling cadence that feeds the chart history. Decoupled from the text ticker so the chart stays smooth even with a long `INTERVAL`.
 - `QUICKCHART_URL` (default `https://quickchart.io`) — base URL of QuickChart. Override to point at a self-hosted instance.
 

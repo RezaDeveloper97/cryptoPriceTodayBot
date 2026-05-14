@@ -606,38 +606,46 @@ var (
 )
 
 // buildQuickChartReq درخواست POST برای QuickChart می‌سازد — نمودار میله‌ای
-// عمودی که برای هر ارز یک میله نشان می‌دهد: درصد تغییر قیمت از اولین نمونه
-// تا آخرین نمونه داخل پنجره. رنگ هر میله = رنگ همان ارز در coinColors.
-func buildQuickChartReq(snap []sample, minY, maxY float64) map[string]interface{} {
-	labels := []string{}
-	data := []float64{}
-	colors := []string{}
+// عمودی فقط مثبت که برای هر ارز یک میله نشان می‌دهد: قیمت دلاری ارز در
+// آخرین نمونه. میله‌ها از گرون‌ترین به ارزون‌ترین مرتب می‌شوند و رنگ هر میله
+// از coinColors می‌آید. محور Y از 0 شروع می‌شود.
+func buildQuickChartReq(snap []sample, maxY float64) map[string]interface{} {
+	type bar struct {
+		symbol string
+		price  float64
+		color  string
+	}
+	bars := make([]bar, 0, len(coins))
 
+	last := snap[len(snap)-1]
 	for _, c := range coins {
-		var base, last float64
-		has := false
-		for _, s := range snap {
-			p, ok := s.prices[c.ID]
-			if !ok || p <= 0 {
-				continue
-			}
-			if !has {
-				base = p
-				has = true
-			}
-			last = p
-		}
-		if !has || base == 0 {
+		p, ok := last.prices[c.ID]
+		if !ok || p <= 0 {
 			continue
 		}
-		labels = append(labels, c.Symbol)
-		data = append(data, (last/base-1)*100)
 		col := coinColors[c.ID]
-		colors = append(colors, fmt.Sprintf("#%02X%02X%02X", col.R, col.G, col.B))
+		bars = append(bars, bar{
+			symbol: c.Symbol,
+			price:  p,
+			color:  fmt.Sprintf("#%02X%02X%02X", col.R, col.G, col.B),
+		})
+	}
+	// مرتب‌سازی نزولی بر اساس قیمت دلاری (گرون‌ترین در سمت چپ)
+	sort.SliceStable(bars, func(i, j int) bool {
+		return bars[i].price > bars[j].price
+	})
+
+	labels := make([]string, len(bars))
+	data := make([]float64, len(bars))
+	colors := make([]string, len(bars))
+	for i, b := range bars {
+		labels[i] = b.symbol
+		data[i] = b.price
+		colors[i] = b.color
 	}
 
 	dataset := map[string]interface{}{
-		"label":           "% Change",
+		"label":           "USD Price",
 		"data":            data,
 		"backgroundColor": colors,
 		"borderColor":     colors,
@@ -668,7 +676,7 @@ func buildQuickChartReq(snap []sample, minY, maxY float64) map[string]interface{
 					"align":     "end",
 					"clip":      false,
 					"color":     "#E5E7EB",
-					"font":      map[string]interface{}{"size": 24, "weight": "bold"},
+					"font":      map[string]interface{}{"size": 22, "weight": "bold"},
 					"formatter": "__FORMATTER__",
 				},
 			},
@@ -683,13 +691,14 @@ func buildQuickChartReq(snap []sample, minY, maxY float64) map[string]interface{
 					"border": map[string]interface{}{"color": "rgba(255,255,255,0.15)"},
 				},
 				"y": map[string]interface{}{
-					"min": minY,
-					"max": maxY,
+					"min":         0,
+					"max":         maxY,
+					"beginAtZero": true,
 					"ticks": map[string]interface{}{
 						"color":   "#9CA3AF",
 						"padding": 8,
 						"font":    map[string]interface{}{"size": 22},
-						"format":  map[string]interface{}{"style": "decimal", "minimumFractionDigits": 2, "maximumFractionDigits": 2, "signDisplay": "exceptZero"},
+						"format":  map[string]interface{}{"style": "currency", "currency": "USD", "notation": "compact", "maximumFractionDigits": 1},
 					},
 					"grid": map[string]interface{}{"color": "rgba(255,255,255,0.07)", "drawBorder": false},
 				},
@@ -699,10 +708,12 @@ func buildQuickChartReq(snap []sample, minY, maxY float64) map[string]interface{
 
 	// chart را به‌صورت رشته JS (نه شیء JSON تو در تو) می‌فرستیم تا formatter
 	// به‌عنوان تابع واقعی JavaScript توسط QuickChart اجرا شود.
+	// formatter: قیمت‌های ≥ ۱۰هزار را به‌صورت "$95k"، ≥ ۱ را با کاما و دو رقم
+	// اعشار، و کمتر از یک دلار را با ۶ رقم اعشار نشان می‌دهد.
 	cfgBytes, _ := json.Marshal(cfg)
 	cfgStr := strings.Replace(string(cfgBytes),
 		`"__FORMATTER__"`,
-		`function(v){return (v>=0?'+':'')+v.toFixed(2)+'%';}`,
+		`function(v){if(v>=10000){var k=Math.round(v/1000);return '$'+k.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')+'k';}if(v>=1)return '$'+v.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,',');return '$'+v.toFixed(6);}`,
 		1)
 
 	return map[string]interface{}{
@@ -756,7 +767,7 @@ func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, sn
 	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: bgDark}, image.Point{}, draw.Src)
 
 	// عنوان بالا
-	drawText(canvas, 30, 45, faceTitle, textBright, "Crypto Market — % Change")
+	drawText(canvas, 30, 45, faceTitle, textBright, "Crypto Market — USD Prices")
 	tehran, err := time.LoadLocation("Asia/Tehran")
 	if err != nil {
 		tehran = time.UTC
@@ -764,53 +775,26 @@ func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, sn
 	subtitle := fmt.Sprintf("Window: %s   |   %s (Tehran)", windowLabel, now.In(tehran).Format("2006-01-02 15:04:05"))
 	drawText(canvas, width-30-textWidth(faceRegular, subtitle), 45, faceRegular, textMuted, subtitle)
 
-	// برای نمودار میله‌ای، هر ارز یک مقدار دارد: درصد تغییر از اولین تا آخرین
-	// نمونه داخل پنجره. min/max را از همین مقادیر محاسبه می‌کنیم. صفر همیشه
-	// در محدوده هست تا میله‌ها پایه واضح داشته باشند.
-	minY, maxY := 0.0, 0.0
-	if len(snap) >= 2 {
-		for _, c := range coins {
-			var base, last float64
-			has := false
-			for _, s := range snap {
-				p, ok := s.prices[c.ID]
-				if !ok || p <= 0 {
-					continue
-				}
-				if !has {
-					base = p
-					has = true
-				}
-				last = p
-			}
-			if !has || base == 0 {
-				continue
-			}
-			yv := (last/base - 1) * 100
-			if yv < minY {
-				minY = yv
-			}
-			if yv > maxY {
-				maxY = yv
+	// نمودار قیمت دلاری: محور Y از 0 تا بیشترین قیمت در آخرین نمونه + ۱۵٪ padding
+	// برای جا دادن لیبل بالای بلندترین میله. فقط نیمه مثبت محور Y استفاده می‌شود.
+	maxY := 0.0
+	if len(snap) >= 1 {
+		last := snap[len(snap)-1]
+		for _, p := range last.prices {
+			if p > maxY {
+				maxY = p
 			}
 		}
 	}
-	// حداقل ±0.5% تا وقتی همه چیز نزدیک صفر است نمودار بیش از حد بزرگ‌نمایی نشود
-	if maxY < 0.5 {
-		maxY = 0.5
+	if maxY <= 0 {
+		maxY = 1
 	}
-	if minY > -0.5 {
-		minY = -0.5
-	}
-	// padding بالا و پایین برای جا دادن لیبل مقدار روی میله‌ها
-	span := maxY - minY
-	maxY += span * 0.12
-	minY -= span * 0.08
+	maxY *= 1.15
 
 	chartImgRect := image.Rect(0, chartTop, width, chartTop+chartH)
 
 	if len(snap) >= 2 {
-		qcReq := buildQuickChartReq(snap, minY, maxY)
+		qcReq := buildQuickChartReq(snap, maxY)
 		pngBytes, err := fetchQuickChartPNG(ctx, client, baseURL, qcReq)
 		if err != nil {
 			return nil, fmt.Errorf("رندر QuickChart: %w", err)
