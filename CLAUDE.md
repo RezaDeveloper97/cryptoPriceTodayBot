@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a multi-line price chart (one color per coin) as a PNG and posts it on a separate, configurable ticker via `sendPhoto`. Depends on `github.com/wcharczuk/go-chart/v2` (chart rendering) and `golang.org/x/image` (font drawing) — everything else is stdlib.
+Single-file Go Telegram bot that fetches crypto prices from CoinGecko on a ticker and posts a formatted Markdown message to a Telegram channel. Also renders a multi-line price chart (one color per coin) as a TradingView-styled dark PNG and posts it on a separate, configurable ticker via `sendPhoto`. Chart rendering uses **QuickChart** (https://quickchart.io — POST JSON, get PNG; free tier 60 req/min, or self-host with `ianw/quickchart` Docker image). Go-side dependency: `golang.org/x/image` (font drawing + high-quality bilinear scaling). Everything else is stdlib.
 
 ## Commands
 
@@ -24,17 +24,23 @@ Optional `INTERVAL` env var accepts any `time.ParseDuration` value (default `1m`
 
 Chart envs:
 - `CHART_INTERVAL` (default `5m`) — how often the chart image is posted.
-- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Y-axis = percentage change from the first sample inside the window.
+- `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Y-axis = percentage change from the first sample inside the window (clamped to a minimum span of ±0.5% to avoid stretched-looking flat periods).
+- `SAMPLE_INTERVAL` (default `20s`) — independent sampling cadence that feeds the chart history. Decoupled from the text ticker so the chart stays smooth even with a long `INTERVAL`.
+- `QUICKCHART_URL` (default `https://quickchart.io`) — base URL of QuickChart. Override to point at a self-hosted instance.
 
 ## Architecture
 
-All logic lives in `main.go`. The flow is a single goroutine driven by `time.Ticker`:
+All logic lives in `main.go`. Three goroutines run concurrently after `main()`:
 
-1. `loadConfig` reads env vars into `Config`.
-2. `main` builds an `http.Client` (20s timeout), sets up `signal.NotifyContext` for SIGINT/SIGTERM, runs one cycle immediately, then loops on the ticker.
-3. `runCycle` wraps each iteration in its own 30s `context.WithTimeout` so a slow cycle cannot block the next tick. It calls `fetchPrices` → `formatMessage` → `sendToTelegram` and logs (never exits) on error.
-4. `fetchPrices` makes one batched CoinGecko `/simple/price` request for all coin IDs in the package-level `coins` slice.
-5. `formatMessage` builds a Telegram Markdown message with 🟢/🔴 based on 24h change, prices formatted via `formatPrice`/`addThousandsSep` (2 decimals + thousands separators above $1, 6 decimals below), and a timestamp in `Asia/Tehran`.
+1. **Text ticker** (`runCycle`) — every `INTERVAL`. Calls `fetchPrices` + `fetchWTIPerp` + `fetchUSDInToman`, builds a Markdown message via `formatMessage`, and posts via `sendToTelegram`. Each cycle is wrapped in a 30s `context.WithTimeout`. Also pushes the fetched prices into the shared `history` buffer.
+2. **Sample ticker** — every `SAMPLE_INTERVAL`. Same fetch as above but skips the Telegram message; only records into `history`. Decoupled so chart density doesn't depend on text cadence.
+3. **Chart ticker** (`runChartCycle`) — every `CHART_INTERVAL`. Snapshots `history` for the active window, builds a Chart.js v3 config in `buildQuickChartReq`, POSTs to `QUICKCHART_URL/chart` via `fetchQuickChartPNG`, composes the returned PNG with a price-list grid + USD→Toman footer inside `renderChartPNG`, and posts via `sendPhoto`.
+
+The `history` struct (mutex-protected `[]sample`) is the single source of shared state. `maxAge = ChartWindowDur` (0 for `session`) caps memory.
+
+`fetchPrices` makes one batched CoinGecko `/simple/price` request for all coin IDs in the package-level `coins` slice. `fetchWTIPerp` hits the Hyperliquid derivatives endpoint separately. `fetchUSDInToman` scrapes bonbast.com (two-step CSRF dance — see `bonbastParamRe`).
+
+`renderChartPNG` requests a 2560×1080 PNG from QuickChart with `devicePixelRatio=1`, then scales it down to 1280×540 with `xdraw.CatmullRom.Scale` for crispness. Fonts inside the chart config are sized at ~22–26 pt so they remain readable after the down-scale.
 
 ### Adding a coin
 
@@ -46,3 +52,5 @@ Append to the `coins` slice in `main.go`. The `ID` must match the CoinGecko API 
 - CoinGecko free tier is ~30 req/min; the 1-minute default interval is safe but shorter intervals risk rate-limiting.
 - Errors inside `runCycle` are logged and swallowed by design — the bot keeps running. Don't change this to `log.Fatal`.
 - The README is in Persian; user-facing log messages and errors in code are also Persian. Preserve that when editing.
+- The QuickChart **public** instance is rate-limited (~60 req/min) and shared with everyone. For production, self-host with `docker run -d -p 8080:3400 --name quickchart ianw/quickchart` and set `QUICKCHART_URL=http://localhost:8080`.
+- The Go-side fonts (`goregular`, `gobold`) do not include emoji glyphs. Anything drawn onto the canvas via `font.Drawer` must use plain ASCII/Latin/Persian text — keep emojis out of the rendered PNG (they belong in Telegram captions/text messages only).

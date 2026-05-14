@@ -26,8 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wcharczuk/go-chart/v2"
-	"github.com/wcharczuk/go-chart/v2/drawing"
+	xdraw "golang.org/x/image/draw"
 	xfont "golang.org/x/image/font"
 	"golang.org/x/image/font/gofont/gobold"
 	"golang.org/x/image/font/gofont/goregular"
@@ -82,6 +81,7 @@ type Config struct {
 	ChartWindowDur time.Duration // پنجره نمایش روی نمودار. 0 یعنی session
 	ChartWindowRaw string        // مقدار خام برای نمایش روی عکس
 	SampleInterval time.Duration // فاصله نمونه‌گیری مستقل از تیکر متن - پیش‌فرض 20s
+	QuickChartURL  string        // base URL سرویس QuickChart — پیش‌فرض https://quickchart.io
 }
 
 func loadConfig() (*Config, error) {
@@ -134,6 +134,11 @@ func loadConfig() (*Config, error) {
 		sampleInterval = d
 	}
 
+	quickChart := strings.TrimRight(os.Getenv("QUICKCHART_URL"), "/")
+	if quickChart == "" {
+		quickChart = "https://quickchart.io"
+	}
+
 	return &Config{
 		BotToken:       token,
 		ChannelID:      channel,
@@ -142,6 +147,7 @@ func loadConfig() (*Config, error) {
 		ChartWindowDur: windowDur,
 		ChartWindowRaw: windowRaw,
 		SampleInterval: sampleInterval,
+		QuickChartURL:  quickChart,
 	}, nil
 }
 
@@ -589,44 +595,188 @@ func textWidth(face xfont.Face, s string) int {
 	return d.MeasureString(s).Round()
 }
 
-// renderChartPNG تصویر نهایی PNG را می‌سازد: نمودار + لیست قیمت + نرخ دلار
-func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float64, windowLabel string, now time.Time) ([]byte, error) {
+// رنگ‌های تم تیره مشابه TradingView
+var (
+	bgDark      = color.RGBA{0x13, 0x17, 0x22, 0xFF}
+	bgCard      = color.RGBA{0x1E, 0x22, 0x2D, 0xFF}
+	textBright  = color.RGBA{0xE5, 0xE7, 0xEB, 0xFF}
+	textMuted   = color.RGBA{0x9C, 0xA3, 0xAF, 0xFF}
+	textDim     = color.RGBA{0x6B, 0x72, 0x80, 0xFF}
+	greenTV     = color.RGBA{0x26, 0xA6, 0x9A, 0xFF}
+	redTV       = color.RGBA{0xEF, 0x53, 0x50, 0xFF}
+)
+
+// quickChartDataset یک سری داده برای Chart.js
+type quickChartDataset struct {
+	Label           string    `json:"label"`
+	Data            []float64 `json:"data"`
+	BorderColor     string    `json:"borderColor"`
+	BackgroundColor string    `json:"backgroundColor"`
+	Tension         float64   `json:"tension"`
+	BorderWidth     float64   `json:"borderWidth"`
+	PointRadius     int       `json:"pointRadius"`
+	Fill            bool      `json:"fill"`
+	CubicInterpMode string    `json:"cubicInterpolationMode"`
+}
+
+// buildQuickChartReq کانفیگ POST برای QuickChart می‌سازد
+func buildQuickChartReq(snap []sample, xFormat string, minY, maxY float64) map[string]interface{} {
+	labels := make([]string, len(snap))
+	for i, s := range snap {
+		labels[i] = s.t.Format(xFormat)
+	}
+
+	datasets := []quickChartDataset{}
+	for _, c := range coins {
+		var base float64
+		ys := make([]float64, 0, len(snap))
+		has := false
+		for _, s := range snap {
+			p, ok := s.prices[c.ID]
+			if !ok || p <= 0 {
+				ys = append(ys, math.NaN())
+				continue
+			}
+			if base == 0 {
+				base = p
+			}
+			ys = append(ys, (p/base-1)*100)
+			has = true
+		}
+		if !has {
+			continue
+		}
+		col := coinColors[c.ID]
+		hex := fmt.Sprintf("#%02X%02X%02X", col.R, col.G, col.B)
+		datasets = append(datasets, quickChartDataset{
+			Label:           c.Symbol,
+			Data:            ys,
+			BorderColor:     hex,
+			BackgroundColor: "transparent",
+			Tension:         0.35,
+			BorderWidth:     5.0,
+			PointRadius:     0,
+			Fill:            false,
+			CubicInterpMode: "monotone",
+		})
+	}
+
+	cfg := map[string]interface{}{
+		"type": "line",
+		"data": map[string]interface{}{
+			"labels":   labels,
+			"datasets": datasets,
+		},
+		"options": map[string]interface{}{
+			"responsive":          false,
+			"maintainAspectRatio": false,
+			"interaction":         map[string]interface{}{"intersect": false},
+			"plugins": map[string]interface{}{
+				"legend": map[string]interface{}{
+					"position": "top",
+					"align":    "center",
+					"labels": map[string]interface{}{
+						"color":      "#E5E7EB",
+						"boxWidth":   36,
+						"boxHeight":  6,
+						"padding":    18,
+						"usePointStyle": false,
+						"font":       map[string]interface{}{"size": 26, "weight": "bold"},
+					},
+				},
+				"title": map[string]interface{}{"display": false},
+			},
+			"scales": map[string]interface{}{
+				"x": map[string]interface{}{
+					"ticks": map[string]interface{}{
+						"color":         "#9CA3AF",
+						"maxRotation":   0,
+						"autoSkip":      true,
+						"maxTicksLimit": 8,
+						"padding":       8,
+						"font":          map[string]interface{}{"size": 22},
+					},
+					"grid": map[string]interface{}{"color": "rgba(255,255,255,0.05)", "drawBorder": false},
+				},
+				"y": map[string]interface{}{
+					"min": minY,
+					"max": maxY,
+					"ticks": map[string]interface{}{
+						"color":   "#9CA3AF",
+						"padding": 8,
+						"font":    map[string]interface{}{"size": 22},
+						"format":  map[string]interface{}{"style": "decimal", "minimumFractionDigits": 2, "maximumFractionDigits": 2, "signDisplay": "exceptZero"},
+					},
+					"grid": map[string]interface{}{"color": "rgba(255,255,255,0.07)", "drawBorder": false},
+				},
+			},
+		},
+	}
+
+	return map[string]interface{}{
+		"chart":            cfg,
+		"width":            2560, // ۲x برای کرامیت — بعد در Go با CatmullRom scale می‌شود
+		"height":           1080,
+		"format":           "png",
+		"version":          "3",
+		"backgroundColor":  "#131722",
+		"devicePixelRatio": 1.0,
+	}
+}
+
+// fetchQuickChartPNG درخواست را به QuickChart می‌فرستد و PNG را می‌گیرد
+func fetchQuickChartPNG(ctx context.Context, client *http.Client, baseURL string, req map[string]interface{}) ([]byte, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chart", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "image/png")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("درخواست QuickChart شکست خورد: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("QuickChart کد %d: %s", resp.StatusCode, string(buf))
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// renderChartPNG تصویر نهایی PNG را می‌سازد: نمودار QuickChart + لیست قیمت + نرخ دلار
+func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, snap []sample, current map[string]priceInfo, usdToman float64, windowLabel string, now time.Time) ([]byte, error) {
 	const (
-		width      = 1280
-		height     = 960
-		chartH     = 540
-		chartTop   = 70
-		pricesTop  = chartTop + chartH + 20
-		footerTop  = height - 50
-		bgColor    = 0xFAFAFA
-		titleColor = 0x1A1A1A
+		width     = 1280
+		height    = 960
+		chartH    = 540
+		chartTop  = 70
+		pricesTop = chartTop + chartH + 40
+		footerTop = height - 60
 	)
 
 	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
-	// پس‌زمینه روشن
-	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{0xFA, 0xFA, 0xFA, 0xFF}}, image.Point{}, draw.Src)
-	_ = bgColor
-	_ = titleColor
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: bgDark}, image.Point{}, draw.Src)
 
-	// عنوان بالا (بدون ایموجی چون فونت Go گلیف ایموجی ندارد)
-	title := "Crypto Market — % Change"
-	drawText(canvas, 30, 45, faceTitle, color.RGBA{0x1A, 0x1A, 0x1A, 0xFF}, title)
+	// عنوان بالا
+	drawText(canvas, 30, 45, faceTitle, textBright, "Crypto Market — % Change")
 	tehran, err := time.LoadLocation("Asia/Tehran")
 	if err != nil {
 		tehran = time.UTC
 	}
 	subtitle := fmt.Sprintf("Window: %s   |   %s (Tehran)", windowLabel, now.In(tehran).Format("2006-01-02 15:04:05"))
-	drawText(canvas, width-30-textWidth(faceRegular, subtitle), 45, faceRegular, color.RGBA{0x55, 0x55, 0x55, 0xFF}, subtitle)
+	drawText(canvas, width-30-textWidth(faceRegular, subtitle), 45, faceRegular, textMuted, subtitle)
 
-	// تولید نمودار با go-chart
-	series := []chart.Series{}
+	// محاسبه min/max و فرمت محور X
 	minY, maxY := math.Inf(1), math.Inf(-1)
 	if len(snap) >= 2 {
 		for _, c := range coins {
-			// قیمت پایه (اولین قیمت غیرصفر این ارز در snap)
 			var base float64
-			var xs []time.Time
-			var ys []float64
 			for _, s := range snap {
 				p, ok := s.prices[c.ID]
 				if !ok || p <= 0 {
@@ -636,8 +786,6 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 					base = p
 				}
 				yv := (p/base - 1) * 100
-				xs = append(xs, s.t)
-				ys = append(ys, yv)
 				if yv < minY {
 					minY = yv
 				}
@@ -645,23 +793,8 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 					maxY = yv
 				}
 			}
-			if len(xs) < 2 {
-				continue
-			}
-			col := coinColors[c.ID]
-			series = append(series, chart.TimeSeries{
-				Name:    c.Symbol,
-				XValues: xs,
-				YValues: ys,
-				Style: chart.Style{
-					StrokeColor: drawing.Color{R: col.R, G: col.G, B: col.B, A: 0xFF},
-					StrokeWidth: 2.8,
-				},
-			})
 		}
 	}
-
-	// محاسبه محدوده Y با حداقل ±0.5% تا وقتی تغییرات کوچک‌اند چارت کشیده نشود
 	if math.IsInf(minY, 1) {
 		minY, maxY = -0.5, 0.5
 	}
@@ -671,12 +804,10 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 		minY = mid - 0.5
 		maxY = mid + 0.5
 	} else {
-		// padding ۱۰٪
 		minY -= span * 0.1
 		maxY += span * 0.1
 	}
 
-	// تشخیص فرمت محور X بر اساس بازه زمانی
 	xFormat := "01-02 15:04"
 	if len(snap) >= 2 {
 		dur := snap[len(snap)-1].t.Sub(snap[0].t)
@@ -690,59 +821,26 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 
 	chartImgRect := image.Rect(0, chartTop, width, chartTop+chartH)
 
-	if len(series) >= 1 {
-		graph := chart.Chart{
-			Width:  width,
-			Height: chartH,
-			Background: chart.Style{
-				FillColor: drawing.Color{R: 0xFA, G: 0xFA, B: 0xFA, A: 0xFF},
-				Padding:   chart.Box{Top: 10, Left: 20, Right: 30, Bottom: 10},
-			},
-			Canvas: chart.Style{
-				FillColor: drawing.Color{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF},
-			},
-			XAxis: chart.XAxis{
-				Style: chart.Style{FontSize: 11},
-				ValueFormatter: func(v interface{}) string {
-					if t, ok := v.(float64); ok {
-						return time.Unix(0, int64(t)).Format(xFormat)
-					}
-					if tt, ok := v.(time.Time); ok {
-						return tt.Format(xFormat)
-					}
-					return ""
-				},
-			},
-			YAxis: chart.YAxis{
-				Style: chart.Style{FontSize: 11},
-				Range: &chart.ContinuousRange{Min: minY, Max: maxY},
-				ValueFormatter: func(v interface{}) string {
-					if f, ok := v.(float64); ok {
-						return fmt.Sprintf("%+.2f%%", f)
-					}
-					return ""
-				},
-			},
-			Series: series,
-		}
-		graph.Elements = []chart.Renderable{chart.LegendLeft(&graph)}
-
-		var buf bytes.Buffer
-		if err := graph.Render(chart.PNG, &buf); err != nil {
-			return nil, fmt.Errorf("رندر نمودار شکست خورد: %w", err)
-		}
-		chartImg, err := png.Decode(&buf)
+	if len(snap) >= 2 {
+		qcReq := buildQuickChartReq(snap, xFormat, minY, maxY)
+		pngBytes, err := fetchQuickChartPNG(ctx, client, baseURL, qcReq)
 		if err != nil {
-			return nil, fmt.Errorf("decode نمودار شکست خورد: %w", err)
+			return nil, fmt.Errorf("رندر QuickChart: %w", err)
 		}
-		draw.Draw(canvas, chartImgRect, chartImg, chartImg.Bounds().Min, draw.Over)
+		chartImg, err := png.Decode(bytes.NewReader(pngBytes))
+		if err != nil {
+			return nil, fmt.Errorf("decode QuickChart PNG: %w", err)
+		}
+		// scale با کیفیت بالا از 2560x1080 به اندازه ناحیه چارت
+		xdraw.CatmullRom.Scale(canvas, chartImgRect, chartImg, chartImg.Bounds(), draw.Over, nil)
 	} else {
-		// نمودار هنوز داده کافی ندارد
-		drawText(canvas, width/2-120, chartTop+chartH/2, faceBold, color.RGBA{0x88, 0x88, 0x88, 0xFF},
+		drawText(canvas, width/2-160, chartTop+chartH/2, faceBold, textMuted,
 			"در حال جمع‌آوری داده برای نمودار...")
 	}
 
-	// قیمت‌های زیر نمودار — دو ستون
+	// لیست قیمت در دو ستون با کارت تیره
+	draw.Draw(canvas, image.Rect(20, pricesTop-30, width-20, pricesTop+220), &image.Uniform{C: bgCard}, image.Point{}, draw.Src)
+
 	type row struct {
 		coin   Coin
 		price  float64
@@ -754,7 +852,6 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 		p, ok := current[c.ID]
 		rows = append(rows, row{coin: c, price: p.USD, change: p.Change24h, ok: ok})
 	}
-	// مرتب کن: ابتدا موجودها (با حجم بازار تقریبی)، سپس ناموجودها
 	sort.SliceStable(rows, func(i, j int) bool {
 		if rows[i].ok != rows[j].ok {
 			return rows[i].ok
@@ -765,41 +862,37 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 	colCount := 2
 	rowsPerCol := (len(rows) + colCount - 1) / colCount
 	colW := (width - 60) / colCount
-	rowH := 32
+	rowH := 34
 
 	for i, r := range rows {
 		col := i / rowsPerCol
 		rowIdx := i % rowsPerCol
-		x := 30 + col*colW
+		x := 40 + col*colW
 		y := pricesTop + rowIdx*rowH
 
 		swatch := coinColors[r.coin.ID]
-		// مربع رنگی
 		draw.Draw(canvas,
 			image.Rect(x, y-14, x+16, y+2),
 			&image.Uniform{C: swatch},
 			image.Point{}, draw.Src)
 
-		// نماد
-		drawText(canvas, x+26, y, faceBold, color.RGBA{0x1A, 0x1A, 0x1A, 0xFF}, r.coin.Symbol)
+		drawText(canvas, x+26, y, faceBold, textBright, r.coin.Symbol)
 
-		// قیمت
 		var priceStr string
 		if r.ok {
 			priceStr = "$" + formatPrice(r.price)
 		} else {
 			priceStr = "n/a"
 		}
-		drawText(canvas, x+135, y, faceRegular, color.RGBA{0x22, 0x22, 0x22, 0xFF}, priceStr)
+		drawText(canvas, x+135, y, faceRegular, textBright, priceStr)
 
-		// تغییر 24 ساعته
 		if r.ok {
 			changeStr := fmt.Sprintf("%+.2f%%", r.change)
-			cc := color.RGBA{0x16, 0xa3, 0x4a, 0xFF}
+			cc := greenTV
 			if r.change < 0 {
-				cc = color.RGBA{0xdc, 0x26, 0x26, 0xFF}
+				cc = redTV
 			}
-			drawText(canvas, x+colW-110, y, faceRegular, cc, changeStr)
+			drawText(canvas, x+colW-110, y, faceBold, cc, changeStr)
 		}
 	}
 
@@ -811,11 +904,11 @@ func renderChartPNG(snap []sample, current map[string]priceInfo, usdToman float6
 		footer = "IRR   USD → Toman: unavailable"
 	}
 	fw := textWidth(faceBold, footer)
-	drawText(canvas, (width-fw)/2, footerTop, faceBold, color.RGBA{0x1A, 0x1A, 0x1A, 0xFF}, footer)
+	drawText(canvas, (width-fw)/2, footerTop, faceBold, textBright, footer)
 
 	credit := "Sources: CoinGecko · Hyperliquid · Bonbast"
 	cw := textWidth(faceRegular, credit)
-	drawText(canvas, (width-cw)/2, footerTop+26, faceRegular, color.RGBA{0x77, 0x77, 0x77, 0xFF}, credit)
+	drawText(canvas, (width-cw)/2, footerTop+26, faceRegular, textDim, credit)
 
 	var out bytes.Buffer
 	if err := png.Encode(&out, canvas); err != nil {
@@ -901,7 +994,7 @@ func runChartCycle(ctx context.Context, client *http.Client, cfg *Config, hist *
 		usdToman = 0
 	}
 
-	pngBytes, err := renderChartPNG(snap, current, usdToman, cfg.ChartWindowRaw, time.Now())
+	pngBytes, err := renderChartPNG(cycleCtx, client, cfg.QuickChartURL, snap, current, usdToman, cfg.ChartWindowRaw, time.Now())
 	if err != nil {
 		log.Printf("❌ خطای ساخت نمودار: %v", err)
 		return
