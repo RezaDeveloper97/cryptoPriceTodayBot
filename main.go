@@ -198,6 +198,96 @@ func fetchPrices(ctx context.Context, client *http.Client) (map[string]priceInfo
 	return data, nil
 }
 
+// fetchLivePrice قیمت USD یک ارز را به‌تنهایی از CoinGecko می‌گیرد. برای ارزهایی
+// که در coins ردیابی نمی‌شوند (مثل TRX, POL, ...) استفاده می‌شود.
+func fetchLivePrice(ctx context.Context, client *http.Client, id string) (float64, error) {
+	endpoint := fmt.Sprintf(
+		"https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd",
+		url.QueryEscape(id),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return 0, fmt.Errorf("کد وضعیت CoinGecko %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data map[string]struct {
+		USD float64 `json:"usd"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("پارس پاسخ شکست خورد: %w", err)
+	}
+	p, ok := data[id]
+	if !ok || p.USD <= 0 {
+		return 0, fmt.Errorf("قیمت برای %s پیدا نشد", id)
+	}
+	return p.USD, nil
+}
+
+// loadCoinIndex ۲۵۰ ارز برتر بازار را از CoinGecko می‌گیرد و در symToID /
+// currencyAlias جای می‌دهد تا مبدل بتواند هر ارز معتبری را پشتیبانی کند.
+// ارزهای ردیابی‌شده فعلی override نمی‌شوند. تعداد ارز اضافه‌شده را برمی‌گرداند.
+func loadCoinIndex(ctx context.Context, client *http.Client) (int, error) {
+	const endpoint = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return 0, fmt.Errorf("کد وضعیت CoinGecko %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data []struct {
+		ID     string `json:"id"`
+		Symbol string `json:"symbol"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return 0, fmt.Errorf("پارس پاسخ شکست خورد: %w", err)
+	}
+
+	added := 0
+	for _, c := range data {
+		if c.Symbol == "" || c.ID == "" {
+			continue
+		}
+		sym := strings.ToUpper(c.Symbol)
+		// ارزهای ردیابی‌شده override نمی‌شوند — همان history آن‌ها معتبر است
+		if _, exists := symToID[sym]; exists {
+			continue
+		}
+		symToID[sym] = c.ID
+		currencyAlias[strings.ToLower(c.Symbol)] = sym
+		if lowerID := strings.ToLower(c.ID); lowerID != strings.ToLower(c.Symbol) {
+			// نام id را هم به عنوان alias اضافه کن (مثل "cardano" → "ADA")
+			if _, exists := currencyAlias[lowerID]; !exists {
+				currencyAlias[lowerID] = sym
+			}
+		}
+		added++
+	}
+	return added, nil
+}
+
 // fetchWTIPerp قیمت قرارداد پرپچوال WTI را از Hyperliquid (از طریق CoinGecko) می‌گیرد.
 // WTI روی endpoint simple/price نیست چون یک قرارداد مشتقه است نه توکن اسپات.
 func fetchWTIPerp(ctx context.Context, client *http.Client) (priceInfo, error) {
@@ -574,6 +664,47 @@ func (r *ratesCache) get() (float64, time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.usdToman, r.updatedAt
+}
+
+// livePriceCache قیمت زنده ارزهای غیرردیابی‌شده را برای مدتی نگه می‌دارد
+// تا با هر تبدیل به CoinGecko درخواست نزنیم.
+type livePriceCache struct {
+	mu  sync.Mutex
+	m   map[string]livePrice
+	ttl time.Duration
+}
+
+type livePrice struct {
+	usd       float64
+	fetchedAt time.Time
+}
+
+func (c *livePriceCache) lookup(id string) (float64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.m[id]
+	if !ok || time.Since(p.fetchedAt) > c.ttl {
+		return 0, false
+	}
+	return p.usd, true
+}
+
+func (c *livePriceCache) store(id string, usd float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[string]livePrice)
+	}
+	c.m[id] = livePrice{usd: usd, fetchedAt: time.Now()}
+}
+
+// convDeps وابستگی‌های مشترک تبدیل ارز را در یک struct جمع می‌کند تا
+// امضای توابع داخلی شلوغ نشود.
+type convDeps struct {
+	client *http.Client
+	hist   *history
+	rates  *ratesCache
+	live   *livePriceCache
 }
 
 // sample یک نمونه از قیمت‌های همه ارزها در یک لحظه
@@ -1165,19 +1296,20 @@ func parseConversion(text string) (amount float64, fromSym, toSym string, ok boo
 }
 
 // usdPer قیمت USD برای یک واحد از نماد می‌دهد.
-// USD → 1، TMN/IRR → از کَش نرخ، بقیه → از آخرین نمونه history.
-func usdPer(sym string, hist *history, rates *ratesCache) (float64, error) {
+// USD → 1، TMN/IRR → از کَش نرخ، ارزهای ردیابی‌شده → آخرین نمونه history،
+// بقیه → live cache یا fetch تازه از CoinGecko.
+func usdPer(ctx context.Context, sym string, deps *convDeps) (float64, error) {
 	switch sym {
 	case "USD":
 		return 1.0, nil
 	case "TMN":
-		v, _ := rates.get()
+		v, _ := deps.rates.get()
 		if v <= 0 {
 			return 0, fmt.Errorf("نرخ دلار به تومان هنوز آماده نیست — چند ثانیه دیگر امتحان کنید")
 		}
 		return 1.0 / v, nil
 	case "IRR":
-		v, _ := rates.get()
+		v, _ := deps.rates.get()
 		if v <= 0 {
 			return 0, fmt.Errorf("نرخ دلار به تومان هنوز آماده نیست — چند ثانیه دیگر امتحان کنید")
 		}
@@ -1187,24 +1319,35 @@ func usdPer(sym string, hist *history, rates *ratesCache) (float64, error) {
 		if !ok {
 			return 0, fmt.Errorf("ارز %s پشتیبانی نمی‌شود", sym)
 		}
-		snap := hist.snapshot(0)
-		if len(snap) == 0 {
-			return 0, fmt.Errorf("داده قیمت هنوز جمع‌آوری نشده — چند ثانیه دیگر امتحان کنید")
+		// مرحله ۱: ارزهای ردیابی‌شده مستقیماً از history (رایگان، فوری)
+		snap := deps.hist.snapshot(0)
+		if len(snap) > 0 {
+			if p, ok := snap[len(snap)-1].prices[id]; ok && p > 0 {
+				return p, nil
+			}
 		}
-		p, ok := snap[len(snap)-1].prices[id]
-		if !ok || p <= 0 {
+		// مرحله ۲: live cache (تا ۶۰ ثانیه)
+		if p, ok := deps.live.lookup(id); ok {
+			return p, nil
+		}
+		// مرحله ۳: fetch تازه از CoinGecko با timeout مستقل
+		liveCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		p, err := fetchLivePrice(liveCtx, deps.client, id)
+		if err != nil {
 			return 0, fmt.Errorf("قیمت %s در دسترس نیست", sym)
 		}
+		deps.live.store(id, p)
 		return p, nil
 	}
 }
 
-func convert(amount float64, fromSym, toSym string, hist *history, rates *ratesCache) (result, rate float64, err error) {
-	fromUSD, err := usdPer(fromSym, hist, rates)
+func convert(ctx context.Context, amount float64, fromSym, toSym string, deps *convDeps) (result, rate float64, err error) {
+	fromUSD, err := usdPer(ctx, fromSym, deps)
 	if err != nil {
 		return 0, 0, err
 	}
-	toUSD, err := usdPer(toSym, hist, rates)
+	toUSD, err := usdPer(ctx, toSym, deps)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1246,13 +1389,13 @@ func formatConvertReply(amount float64, fromSym string, result float64, toSym st
 }
 
 const welcomeMessage = "سلام 👋\nهرچیزی را به هرچیزی تبدیل کن — کافیست متنش را بفرستی:\n\n" +
-	"`100 usdt irr`\n`2.5 btc toman`\n`5,000,000 toman btc`\n`1 eth usd`\n\n" +
-	"ارزها: btc, eth, usdt, bnb, xrp, sol, doge, xaut, paxg, slvon, wti\n" +
+	"`100 usdt irr`\n`2.5 btc toman`\n`5,000,000 toman btc`\n`100 trx usd`\n`50 pol usdt`\n\n" +
+	"از ۲۵۰ ارز برتر بازار پشتیبانی می‌شود (btc, eth, usdt, trx, pol, ada, sol, doge, …)\n" +
 	"فیات: usd, irr (ریال), tmn (تومان)"
 
 const usageHint = "متوجه نشدم 🤔 یک نمونه‌ی درست:\n\n" +
-	"`100 usdt irr`\n`2.5 btc toman`\n`1 eth usd`\n\n" +
-	"ارزها: btc, eth, usdt, bnb, xrp, sol, doge, xaut, paxg, slvon, wti\n" +
+	"`100 usdt irr`\n`2.5 btc toman`\n`100 trx usd`\n`50 pol usdt`\n\n" +
+	"از ۲۵۰ ارز برتر بازار پشتیبانی می‌شود.\n" +
 	"فیات: usd, irr (ریال), tmn (تومان)"
 
 func quickKeyboardMarkup() string {
@@ -1289,7 +1432,7 @@ type tgUpdate struct {
 
 // runUpdatesLoop با long-polling آپدیت‌ها را می‌گیرد و پاسخ تبدیل می‌فرستد.
 // خطاها فقط لاگ می‌شوند و حلقه ادامه پیدا می‌کند.
-func runUpdatesLoop(ctx context.Context, cfg *Config, hist *history, rates *ratesCache) {
+func runUpdatesLoop(ctx context.Context, cfg *Config, deps *convDeps) {
 	poll := &http.Client{Timeout: 40 * time.Second}
 	var offset int64
 
@@ -1346,18 +1489,18 @@ func runUpdatesLoop(ctx context.Context, cfg *Config, hist *history, rates *rate
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
 			}
-			handleUpdate(ctx, poll, cfg, hist, rates, u)
+			handleUpdate(ctx, cfg, deps, u)
 		}
 	}
 }
 
-func handleUpdate(ctx context.Context, client *http.Client, cfg *Config, hist *history, rates *ratesCache, u tgUpdate) {
+func handleUpdate(ctx context.Context, cfg *Config, deps *convDeps, u tgUpdate) {
 	if u.CallbackQuery != nil {
 		cb := u.CallbackQuery
 		defer func() {
 			ackCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			if err := answerCallback(ackCtx, client, cfg, cb.ID); err != nil {
+			if err := answerCallback(ackCtx, deps.client, cfg, cb.ID); err != nil {
 				log.Printf("⚠️ answerCallback: %v", err)
 			}
 		}()
@@ -1372,14 +1515,14 @@ func handleUpdate(ctx context.Context, client *http.Client, cfg *Config, hist *h
 		from, to := parts[2], parts[3]
 		replyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
-		result, rate, err := convert(amt, from, to, hist, rates)
+		result, rate, err := convert(replyCtx, amt, from, to, deps)
 		var text string
 		if err != nil {
 			text = "❌ " + err.Error()
 		} else {
 			text = formatConvertReply(amt, from, result, to, rate)
 		}
-		if err := sendPrivate(replyCtx, client, cfg, cb.Message.Chat.ID, text, ""); err != nil {
+		if err := sendPrivate(replyCtx, deps.client, cfg, cb.Message.Chat.ID, text, ""); err != nil {
 			log.Printf("⚠️ sendPrivate (callback): %v", err)
 		}
 		return
@@ -1398,7 +1541,7 @@ func handleUpdate(ctx context.Context, client *http.Client, cfg *Config, hist *h
 	defer cancel()
 
 	if strings.HasPrefix(text, "/start") {
-		if err := sendPrivate(replyCtx, client, cfg, chatID, welcomeMessage, quickKeyboardMarkup()); err != nil {
+		if err := sendPrivate(replyCtx, deps.client, cfg, chatID, welcomeMessage, quickKeyboardMarkup()); err != nil {
 			log.Printf("⚠️ sendPrivate (/start): %v", err)
 		}
 		return
@@ -1406,19 +1549,19 @@ func handleUpdate(ctx context.Context, client *http.Client, cfg *Config, hist *h
 
 	amount, from, to, ok := parseConversion(text)
 	if !ok {
-		if err := sendPrivate(replyCtx, client, cfg, chatID, usageHint, ""); err != nil {
+		if err := sendPrivate(replyCtx, deps.client, cfg, chatID, usageHint, ""); err != nil {
 			log.Printf("⚠️ sendPrivate (usage): %v", err)
 		}
 		return
 	}
-	result, rate, err := convert(amount, from, to, hist, rates)
+	result, rate, err := convert(replyCtx, amount, from, to, deps)
 	var reply string
 	if err != nil {
 		reply = "❌ " + err.Error()
 	} else {
 		reply = formatConvertReply(amount, from, result, to, rate)
 	}
-	if err := sendPrivate(replyCtx, client, cfg, chatID, reply, ""); err != nil {
+	if err := sendPrivate(replyCtx, deps.client, cfg, chatID, reply, ""); err != nil {
 		log.Printf("⚠️ sendPrivate (conv): %v", err)
 	}
 }
@@ -1432,6 +1575,8 @@ func main() {
 	client := &http.Client{Timeout: 20 * time.Second}
 	hist := &history{maxAge: cfg.ChartWindowDur}
 	rates := &ratesCache{}
+	live := &livePriceCache{ttl: 60 * time.Second}
+	deps := &convDeps{client: client, hist: hist, rates: rates, live: live}
 
 	// graceful shutdown با Ctrl+C یا SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -1439,6 +1584,17 @@ func main() {
 
 	log.Printf("🚀 ربات شروع به کار کرد — بازه متن: %s — نمونه‌گیری: %s — بازه نمودار: %s — پنجره: %s — کانال: %s",
 		cfg.Interval, cfg.SampleInterval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
+
+	// ایندکس ارزها از CoinGecko (۲۵۰ ارز برتر بازار) برای اینکه مبدل بتواند
+	// هر ارز معتبری را پشتیبانی کند، نه فقط ارزهای ردیابی‌شده. شکست خوردنش
+	// بحرانی نیست — فقط ارزهای داخل coins کار می‌کنند.
+	bootCtx, bootCancel := context.WithTimeout(ctx, 15*time.Second)
+	if n, err := loadCoinIndex(bootCtx, client); err != nil {
+		log.Printf("⚠️ بارگذاری ایندکس ارزها شکست خورد — فقط ارزهای ردیابی‌شده در دسترس مبدل خواهند بود: %v", err)
+	} else {
+		log.Printf("📖 ایندکس ارزها بارگذاری شد — %d ارز اضافی برای مبدل", n)
+	}
+	bootCancel()
 
 	// اولین چرخه متن را بلافاصله بفرست (هم history را پر می‌کند هم پیام را)
 	runCycle(ctx, client, cfg, hist, rates)
@@ -1490,7 +1646,7 @@ func main() {
 	}()
 
 	// goroutine مستقل برای دریافت پیام‌های خصوصی و پاسخ تبدیل ارز
-	go runUpdatesLoop(ctx, cfg, hist, rates)
+	go runUpdatesLoop(ctx, cfg, deps)
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
