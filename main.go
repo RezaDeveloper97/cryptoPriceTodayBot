@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math/rand/v2"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -465,6 +466,15 @@ func parseBonbastFloat(raw any) (float64, bool) {
 // JPY پس از تقسیم بر ۱۰۰ به ازای یک واحد نرمالایز می‌شود).
 // شکست در دریافت usd1 → خطا. شکست در سایر ارزها → لاگ هشدار و رد شدن (fail-soft).
 func fetchFiatRates(ctx context.Context, baseClient *http.Client) (float64, map[string]float64, error) {
+	// jitter ۱ تا ۱۰ ثانیه پیش از درخواست، تا الگوی دقیقاً هر ۱ دقیقه‌ای
+	// از دید فایروال bonbast شبیه روبات به نظر نیاید.
+	jitter := time.Duration(1+rand.IntN(10)) * time.Second
+	select {
+	case <-time.After(jitter):
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+
 	// کوکی‌جار محلی برای هر فراخوانی، چون پارامتر صفحه و کوکی‌اش با هم گره خورده‌اند
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -1320,7 +1330,7 @@ func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, sn
 // runCycle یک چرخه کامل: دریافت قیمت + ارسال پیام متنی + ثبت در history
 func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history, rates *ratesCache) {
 	// timeout مستقل برای هر چرخه تا اگر شبکه کند بود، چرخه بعدی قفل نشود
-	cycleCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	cycleCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	prices, err := fetchPrices(cycleCtx, client)
