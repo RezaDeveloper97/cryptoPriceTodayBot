@@ -615,8 +615,9 @@ func formatFiatBlock(fiat map[string]float64) string {
 		return s
 	}
 	var b strings.Builder
-	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	b.WriteString("💱 نرخ ارز (تومان)\n")
+	b.WriteString("💱 Exchange Rates (Toman)\n")
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	for i := 0; i < len(entries); i += 2 {
 		left := fmt.Sprintf("%s %s %s", entries[i].flag, entries[i].sym, pad(entries[i].val))
 		if i+1 < len(entries) {
@@ -652,6 +653,10 @@ func formatMessage(prices map[string]priceInfo, usdToman float64, fiat map[strin
 	}
 
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	if fiatBlock := formatFiatBlock(fiat); fiatBlock != "" {
+		b.WriteString(fiatBlock)
+		b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	}
 	if usdToman > 0 {
 		fmt.Fprintf(&b,
 			"💵 1 USD ≈ %s Toman\n",
@@ -660,8 +665,6 @@ func formatMessage(prices map[string]priceInfo, usdToman float64, fiat map[strin
 	} else {
 		b.WriteString("💵 USD/IRR unavailable\n")
 	}
-
-	b.WriteString(formatFiatBlock(fiat))
 
 	// زمان به وقت تهران
 	loc, err := time.LoadLocation("Asia/Tehran")
