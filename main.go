@@ -83,6 +83,7 @@ type Config struct {
 	ChartWindowDur time.Duration // پنجره نمایش روی نمودار. 0 یعنی session
 	ChartWindowRaw string        // مقدار خام برای نمایش روی عکس
 	QuickChartURL  string        // base URL سرویس QuickChart — پیش‌فرض https://quickchart.io
+	CoinGeckoKey   string        // کلید demo CoinGecko — اختیاری، سقف ۳۰ req/min را آزاد می‌کند
 }
 
 func loadConfig() (*Config, error) {
@@ -133,6 +134,8 @@ func loadConfig() (*Config, error) {
 
 	botUsername := strings.TrimPrefix(strings.TrimSpace(os.Getenv("TELEGRAM_BOT_USERNAME")), "@")
 
+	cgKey := strings.TrimSpace(os.Getenv("COINGECKO_API_KEY"))
+
 	return &Config{
 		BotToken:       token,
 		ChannelID:      channel,
@@ -142,7 +145,32 @@ func loadConfig() (*Config, error) {
 		ChartWindowDur: windowDur,
 		ChartWindowRaw: windowRaw,
 		QuickChartURL:  quickChart,
+		CoinGeckoKey:   cgKey,
 	}, nil
+}
+
+// coinGeckoAuthTransport روی هر درخواست به api.coingecko.com هدر
+// x-cg-demo-api-key را می‌چسباند (سقف رایگان را از ~۱۰ به ۳۰ req/min می‌برد).
+// روی هاست‌های دیگر هیچ تغییری نمی‌دهد، پس درخواست‌های Telegram و Bonbast و
+// QuickChart بدون auth می‌مانند.
+type coinGeckoAuthTransport struct {
+	base http.RoundTripper
+	key  string
+}
+
+func (t *coinGeckoAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.key != "" && req.URL.Hostname() == "api.coingecko.com" {
+		req = req.Clone(req.Context())
+		req.Header.Set("x-cg-demo-api-key", t.key)
+	}
+	return t.base.RoundTrip(req)
+}
+
+// newHTTPClient یک *http.Client می‌سازد که اگر کلید demo داده شده باشد
+// روی فراخوانی‌های CoinGecko خودکار auth می‌کند.
+func newHTTPClient(timeout time.Duration, cgKey string) *http.Client {
+	tr := &coinGeckoAuthTransport{base: http.DefaultTransport, key: cgKey}
+	return &http.Client{Timeout: timeout, Transport: tr}
 }
 
 // ساختار پاسخ CoinGecko برای هر ارز
@@ -1547,7 +1575,7 @@ func main() {
 		log.Fatalf("خطای تنظیمات: %v", err)
 	}
 
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := newHTTPClient(20*time.Second, cfg.CoinGeckoKey)
 	hist := &history{maxAge: cfg.ChartWindowDur}
 	rates := &ratesCache{}
 	live := &livePriceCache{ttl: 5 * time.Minute}

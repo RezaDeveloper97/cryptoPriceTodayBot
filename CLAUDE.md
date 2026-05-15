@@ -22,6 +22,8 @@ go vet ./...
 
 Optional `INTERVAL` env var accepts any `time.ParseDuration` value (default `1m`).
 
+Optional `COINGECKO_API_KEY` — a free demo key from coingecko.com/en/api/pricing. When set, `newHTTPClient` wraps `http.DefaultTransport` with `coinGeckoAuthTransport`, which attaches the `x-cg-demo-api-key` header to every request whose host is exactly `api.coingecko.com` (Telegram/Bonbast/QuickChart requests are untouched). This lifts the public free-tier limit from ~5–10 req/min on VPS IPs to a guaranteed 30 req/min — required in practice on hosting providers because CoinGecko throttles shared IPs aggressively and returns 429.
+
 Chart envs:
 - `CHART_INTERVAL` (default `5m`) — how often the chart image is posted.
 - `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Bar heights come from the **latest** sample in the window (the current USD price of each coin); the window mainly controls how stale `current` is allowed to be. Y-axis max = `1.15 × max(price)` to leave headroom for the value label above the tallest bar.
