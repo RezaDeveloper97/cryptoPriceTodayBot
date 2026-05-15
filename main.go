@@ -54,6 +54,7 @@ var coins = []Coin{
 	{ID: "binancecoin", Symbol: "BNB", Name: "BNB", Emoji: "🟡"},
 	{ID: "ripple", Symbol: "XRP", Name: "Ripple", Emoji: "🔵"},
 	{ID: "solana", Symbol: "SOL", Name: "Solana", Emoji: "🟣"},
+	{ID: "tron", Symbol: "TRX", Name: "Tron", Emoji: "🔴"},
 	{ID: "dogecoin", Symbol: "DOGE", Name: "Dogecoin", Emoji: "🐕"},
 }
 
@@ -69,6 +70,7 @@ var coinColors = map[string]color.RGBA{
 	"binancecoin": {243, 186, 47, 255},
 	"ripple":      {35, 41, 47, 255},
 	"solana":      {153, 69, 255, 255},
+	"tron":        {235, 0, 41, 255},
 	"dogecoin":    {186, 160, 82, 255},
 }
 
@@ -459,20 +461,20 @@ func fetchUSDInToman(ctx context.Context, baseClient *http.Client) (float64, err
 func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 	var b strings.Builder
 	b.WriteString("📊 *Live Crypto Prices*\n")
-	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n\n")
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 
 	for _, c := range coins {
 		p, ok := prices[c.ID]
 		if !ok {
 			continue
 		}
-		sign := "🟢 ▲"
+		sign := "🟢"
 		if p.Change24h < 0 {
-			sign = "🔴 ▼"
+			sign = "🔴"
 		}
 		fmt.Fprintf(&b,
-			"%s *%s* `%s`\n   `$%s`  %s `%+.2f%%`\n\n",
-			c.Emoji, c.Name, c.Symbol,
+			"%s *%s* `$%s` %s `%+.2f%%`\n",
+			c.Emoji, c.Symbol,
 			formatPrice(p.USD), sign, p.Change24h,
 		)
 	}
@@ -480,11 +482,11 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	if usdToman > 0 {
 		fmt.Fprintf(&b,
-			"🇮🇷 *Iranian Rial* `IRR`\n   `1 USD ≈ %s Toman`\n\n",
+			"🇮🇷 *IRR* `1 USD ≈ %s Toman`\n",
 			addThousandsSep(fmt.Sprintf("%.0f", usdToman)),
 		)
 	} else {
-		b.WriteString("🇮🇷 *Iranian Rial* `IRR`\n   _unavailable_\n\n")
+		b.WriteString("🇮🇷 *IRR* _unavailable_\n")
 	}
 
 	// زمان به وقت تهران
@@ -493,7 +495,7 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 		loc = time.UTC
 	}
 	fmt.Fprintf(&b,
-		"🕐 %s (Tehran)\n_Sources: CoinGecko · Nobitex_",
+		"🕐 %s (Tehran) · _CoinGecko · Nobitex_",
 		time.Now().In(loc).Format("2006-01-02 15:04:05"),
 	)
 	return b.String()
