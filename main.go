@@ -82,7 +82,6 @@ type Config struct {
 	ChartInterval  time.Duration // فاصله ارسال عکس نمودار - پیش‌فرض ۵ دقیقه
 	ChartWindowDur time.Duration // پنجره نمایش روی نمودار. 0 یعنی session
 	ChartWindowRaw string        // مقدار خام برای نمایش روی عکس
-	SampleInterval time.Duration // فاصله نمونه‌گیری مستقل از تیکر متن - پیش‌فرض 20s
 	QuickChartURL  string        // base URL سرویس QuickChart — پیش‌فرض https://quickchart.io
 }
 
@@ -127,15 +126,6 @@ func loadConfig() (*Config, error) {
 		windowDur = d
 	}
 
-	sampleInterval := 20 * time.Second
-	if v := os.Getenv("SAMPLE_INTERVAL"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return nil, fmt.Errorf("مقدار SAMPLE_INTERVAL نامعتبر است: %w", err)
-		}
-		sampleInterval = d
-	}
-
 	quickChart := strings.TrimRight(os.Getenv("QUICKCHART_URL"), "/")
 	if quickChart == "" {
 		quickChart = "https://quickchart.io"
@@ -151,7 +141,6 @@ func loadConfig() (*Config, error) {
 		ChartInterval:  chartInterval,
 		ChartWindowDur: windowDur,
 		ChartWindowRaw: windowRaw,
-		SampleInterval: sampleInterval,
 		QuickChartURL:  quickChart,
 	}, nil
 }
@@ -712,7 +701,7 @@ type convDeps struct {
 // sample یک نمونه از قیمت‌های همه ارزها در یک لحظه
 type sample struct {
 	t      time.Time
-	prices map[string]float64 // coin ID -> USD
+	prices map[string]priceInfo // coin ID -> USD + 24h change
 }
 
 // history بافر ایمن از thread برای نگه‌داری نمونه‌های قیمت
@@ -776,9 +765,9 @@ func recordSample(h *history, prices map[string]priceInfo) {
 	if len(prices) == 0 {
 		return
 	}
-	ps := make(map[string]float64, len(prices))
+	ps := make(map[string]priceInfo, len(prices))
 	for id, p := range prices {
-		ps[id] = p.USD
+		ps[id] = p
 	}
 	h.add(sample{t: time.Now(), prices: ps})
 }
@@ -854,13 +843,13 @@ func buildQuickChartReq(snap []sample, maxY float64) map[string]interface{} {
 	last := snap[len(snap)-1]
 	for _, c := range coins {
 		p, ok := last.prices[c.ID]
-		if !ok || p <= 0 {
+		if !ok || p.USD <= 0 {
 			continue
 		}
 		col := coinColors[c.ID]
 		bars = append(bars, bar{
 			symbol: c.Symbol,
-			price:  p,
+			price:  p.USD,
 			color:  fmt.Sprintf("#%02X%02X%02X", col.R, col.G, col.B),
 		})
 	}
@@ -1015,8 +1004,8 @@ func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, sn
 	if len(snap) >= 1 {
 		last := snap[len(snap)-1]
 		for _, p := range last.prices {
-			if p > maxY {
-				maxY = p
+			if p.USD > maxY {
+				maxY = p.USD
 			}
 		}
 	}
@@ -1164,8 +1153,10 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *histo
 	log.Printf("✅ پیام ارسال شد - تعداد ارز: %d", len(prices))
 }
 
-// runChartCycle یک چرخه: گرفتن قیمت دلار + رندر نمودار + ارسال عکس
-func runChartCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history) {
+// runChartCycle یک چرخه: رندر نمودار + ارسال عکس. هیچ درخواست API نمی‌زند —
+// هم قیمت‌ها و درصد ۲۴ ساعته از آخرین نمونه history می‌آید و هم نرخ دلار از
+// ratesCache. fetcher واحد (runCycle) مسئول تازه نگه داشتن این‌هاست.
+func runChartCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history, rates *ratesCache) {
 	cycleCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
@@ -1175,32 +1166,14 @@ func runChartCycle(ctx context.Context, client *http.Client, cfg *Config, hist *
 		return
 	}
 
-	// قیمت‌های فعلی برای لیست زیر نمودار از آخرین نمونه
+	// قیمت‌های فعلی + درصد ۲۴ ساعته از آخرین نمونه history (هر دو در RAM)
 	last := snap[len(snap)-1]
 	current := make(map[string]priceInfo, len(last.prices))
 	for id, p := range last.prices {
-		current[id] = priceInfo{USD: p}
-	}
-	// 24h change از یک fetch تازه (اختیاری — اگر شکست خورد فقط درصد را نشان نمی‌دهیم)
-	if fresh, err := fetchPrices(cycleCtx, client); err == nil {
-		if wti, werr := fetchWTIPerp(cycleCtx, client); werr == nil {
-			fresh["wti-perp"] = wti
-		}
-		for id, p := range fresh {
-			cur := current[id]
-			cur.Change24h = p.Change24h
-			if cur.USD == 0 {
-				cur.USD = p.USD
-			}
-			current[id] = cur
-		}
+		current[id] = p
 	}
 
-	usdToman, err := fetchUSDInToman(cycleCtx, client)
-	if err != nil {
-		log.Printf("⚠️ خطای دریافت دلار برای نمودار: %v", err)
-		usdToman = 0
-	}
+	usdToman, _ := rates.get()
 
 	pngBytes, err := renderChartPNG(cycleCtx, client, cfg.QuickChartURL, snap, current, usdToman, cfg.ChartWindowRaw, time.Now())
 	if err != nil {
@@ -1324,8 +1297,8 @@ func usdPer(ctx context.Context, sym string, deps *convDeps) (float64, error) {
 		// مرحله ۱: ارزهای ردیابی‌شده مستقیماً از history (رایگان، فوری)
 		snap := deps.hist.snapshot(0)
 		if len(snap) > 0 {
-			if p, ok := snap[len(snap)-1].prices[id]; ok && p > 0 {
-				return p, nil
+			if p, ok := snap[len(snap)-1].prices[id]; ok && p.USD > 0 {
+				return p.USD, nil
 			}
 		}
 		// مرحله ۲: live cache (تا ۶۰ ثانیه)
@@ -1577,15 +1550,15 @@ func main() {
 	client := &http.Client{Timeout: 20 * time.Second}
 	hist := &history{maxAge: cfg.ChartWindowDur}
 	rates := &ratesCache{}
-	live := &livePriceCache{ttl: 60 * time.Second}
+	live := &livePriceCache{ttl: 5 * time.Minute}
 	deps := &convDeps{client: client, hist: hist, rates: rates, live: live}
 
 	// graceful shutdown با Ctrl+C یا SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("🚀 ربات شروع به کار کرد — بازه متن: %s — نمونه‌گیری: %s — بازه نمودار: %s — پنجره: %s — کانال: %s",
-		cfg.Interval, cfg.SampleInterval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
+	log.Printf("🚀 ربات شروع به کار کرد — بازه fetch/متن: %s — بازه نمودار: %s — پنجره: %s — کانال: %s",
+		cfg.Interval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
 
 	// ایندکس ارزها از CoinGecko (۲۵۰ ارز برتر بازار) برای اینکه مبدل بتواند
 	// هر ارز معتبری را پشتیبانی کند، نه فقط ارزهای ردیابی‌شده. شکست خوردنش
@@ -1601,39 +1574,8 @@ func main() {
 	// اولین چرخه متن را بلافاصله بفرست (هم history را پر می‌کند هم پیام را)
 	runCycle(ctx, client, cfg, hist, rates)
 
-	// goroutine مستقل برای نمونه‌گیری سریع (بدون ارسال) — تا نمودار داده کافی داشته باشد
-	// و نرخ USD→تومان هم برای مبدل تازه بماند حتی اگر INTERVAL متن طولانی باشد.
-	go func() {
-		tk := time.NewTicker(cfg.SampleInterval)
-		defer tk.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tk.C:
-				sampleCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				prices, err := fetchPrices(sampleCtx, client)
-				if err != nil {
-					log.Printf("⚠️ نمونه‌گیری شکست خورد: %v", err)
-					cancel()
-					continue
-				}
-				if wti, werr := fetchWTIPerp(sampleCtx, client); werr == nil {
-					prices["wti-perp"] = wti
-				}
-				recordSample(hist, prices)
-				// اگر نرخ دلار قدیمی‌تر از ۶۰ ثانیه است، تازه‌اش کن (Bonbast گران است)
-				if _, t := rates.get(); time.Since(t) > 60*time.Second {
-					if v, err := fetchUSDInToman(sampleCtx, client); err == nil && v > 0 {
-						rates.set(v)
-					}
-				}
-				cancel()
-			}
-		}
-	}()
-
-	// goroutine جدا برای ارسال عکس نمودار
+	// goroutine جدا برای ارسال عکس نمودار — هیچ درخواست API نمی‌زند،
+	// فقط از history و ratesCache که توسط runCycle پر می‌شوند، می‌خواند.
 	go func() {
 		tk := time.NewTicker(cfg.ChartInterval)
 		defer tk.Stop()
@@ -1642,7 +1584,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-tk.C:
-				runChartCycle(ctx, client, cfg, hist)
+				runChartCycle(ctx, client, cfg, hist, rates)
 			}
 		}
 	}()

@@ -25,18 +25,20 @@ Optional `INTERVAL` env var accepts any `time.ParseDuration` value (default `1m`
 Chart envs:
 - `CHART_INTERVAL` (default `5m`) — how often the chart image is posted.
 - `CHART_WINDOW` (default `session`) — either `session` (everything since bot start) or any duration like `15m`/`1h`/`24h`. Bar heights come from the **latest** sample in the window (the current USD price of each coin); the window mainly controls how stale `current` is allowed to be. Y-axis max = `1.15 × max(price)` to leave headroom for the value label above the tallest bar.
-- `SAMPLE_INTERVAL` (default `20s`) — independent sampling cadence that feeds the chart history. Decoupled from the text ticker so the chart stays smooth even with a long `INTERVAL`.
 - `QUICKCHART_URL` (default `https://quickchart.io`) — base URL of QuickChart. Override to point at a self-hosted instance.
 
 ## Architecture
 
-All logic lives in `main.go`. Three goroutines run concurrently after `main()`:
+All logic lives in `main.go`. **`runCycle` is the only place that touches the upstream price APIs** — CoinGecko, Hyperliquid, and bonbast.com are each hit at most once per `INTERVAL`. Everything else (chart rendering, currency conversion for tracked coins) reads from in-memory caches. This is deliberate: CoinGecko's free tier rate-limits aggressively on VPS IPs, so the bot collapses all periodic fetches to a single ticker.
 
-1. **Text ticker** (`runCycle`) — every `INTERVAL`. Calls `fetchPrices` + `fetchWTIPerp` + `fetchUSDInToman`, builds a Markdown message via `formatMessage`, and posts via `sendToTelegram`. Each cycle is wrapped in a 30s `context.WithTimeout`. Also pushes the fetched prices into the shared `history` buffer.
-2. **Sample ticker** — every `SAMPLE_INTERVAL`. Same fetch as above but skips the Telegram message; only records into `history`. Decoupled so chart density doesn't depend on text cadence.
-3. **Chart ticker** (`runChartCycle`) — every `CHART_INTERVAL`. Snapshots `history` for the active window, builds a Chart.js v3 config in `buildQuickChartReq`, POSTs to `QUICKCHART_URL/chart` via `fetchQuickChartPNG`, composes the returned PNG with a price-list grid + USD→Toman footer inside `renderChartPNG`, and posts via `sendPhoto`.
+Two goroutines run concurrently after `main()`:
 
-The `history` struct (mutex-protected `[]sample`) is the single source of shared state. `maxAge = ChartWindowDur` (0 for `session`) caps memory.
+1. **Text ticker / fetcher** (`runCycle`) — every `INTERVAL`. The single source of fresh data: calls `fetchPrices` + `fetchWTIPerp` + `fetchUSDInToman`, writes prices (including 24h change) into `history`, writes USD→Toman into `ratesCache`, builds a Markdown message via `formatMessage`, and posts via `sendToTelegram`. Each cycle is wrapped in a 30s `context.WithTimeout`.
+2. **Chart ticker** (`runChartCycle`) — every `CHART_INTERVAL`. Snapshots `history` for the active window, reads `usdToman` from `ratesCache`, builds a Chart.js v3 config in `buildQuickChartReq`, POSTs to `QUICKCHART_URL/chart` via `fetchQuickChartPNG`, composes the returned PNG with a price-list grid + USD→Toman footer inside `renderChartPNG`, and posts via `sendPhoto`. **Performs no upstream API calls** — all data comes from RAM.
+
+A third goroutine (`runUpdatesLoop`) handles incoming Telegram DMs for the converter. For coins in the tracked `coins` slice it reads from `history` (no API hit); for any of the other ~250 indexed coins it falls back to `fetchLivePrice` with a 5-minute `livePriceCache` so repeated user queries don't compound.
+
+The `history` struct (mutex-protected `[]sample`, where each `sample.prices` is `map[string]priceInfo` carrying USD + 24h change) is the single source of shared state alongside `ratesCache`. `maxAge = ChartWindowDur` (0 for `session`) caps memory.
 
 `fetchPrices` makes one batched CoinGecko `/simple/price` request for all coin IDs in the package-level `coins` slice. `fetchWTIPerp` hits the Hyperliquid derivatives endpoint separately. `fetchUSDInToman` scrapes bonbast.com (two-step CSRF dance — see `bonbastParamRe`).
 
