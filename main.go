@@ -586,31 +586,40 @@ func formatFiatBlock(fiat map[string]float64) string {
 	if len(fiat) == 0 {
 		return ""
 	}
-	var rows []string
+	type entry struct {
+		flag, sym, val string
+	}
+	var entries []entry
+	maxValLen := 0
 	for _, f := range fiatCurrencies {
 		v, ok := fiat[f.Symbol]
 		if !ok || v <= 0 {
 			continue
 		}
-		rows = append(rows, fmt.Sprintf(
-			"%s %s %s",
-			f.Flag, f.Symbol,
-			addThousandsSep(fmt.Sprintf("%.0f", v)),
-		))
+		val := addThousandsSep(fmt.Sprintf("%.0f", v))
+		if len(val) > maxValLen {
+			maxValLen = len(val)
+		}
+		entries = append(entries, entry{f.Flag, f.Symbol, val})
 	}
-	if len(rows) == 0 {
+	if len(entries) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	b.WriteString("💱 نرخ ارز (تومان)\n")
-	for i := 0; i < len(rows); i += 2 {
-		if i+1 < len(rows) {
-			fmt.Fprintf(&b, "%s   %s\n", rows[i], rows[i+1])
+	// بلاک کد monospace تا ستون‌ها زیر هم تراز شن (در Markdown قدیمی تلگرام).
+	b.WriteString("```\n")
+	for i := 0; i < len(entries); i += 2 {
+		left := fmt.Sprintf("%s %s %*s", entries[i].flag, entries[i].sym, maxValLen, entries[i].val)
+		if i+1 < len(entries) {
+			right := fmt.Sprintf("%s %s %*s", entries[i+1].flag, entries[i+1].sym, maxValLen, entries[i+1].val)
+			fmt.Fprintf(&b, "%s  %s\n", left, right)
 		} else {
-			fmt.Fprintf(&b, "%s\n", rows[i])
+			fmt.Fprintf(&b, "%s\n", left)
 		}
 	}
+	b.WriteString("```\n")
 	return b.String()
 }
 
