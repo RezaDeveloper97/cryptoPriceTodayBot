@@ -75,6 +75,7 @@ var coinColors = map[string]color.RGBA{
 type Config struct {
 	BotToken       string        // توکن گرفته شده از BotFather
 	ChannelID      string        // @yourchannel یا -100xxxxxxxxx
+	BotUsername    string        // نام کاربری ربات بدون @ برای ساخت لینک عمیق دکمه تبدیل — اختیاری
 	Interval       time.Duration // فاصله ارسال پیام متنی - پیش‌فرض ۱ دقیقه
 	ChartInterval  time.Duration // فاصله ارسال عکس نمودار - پیش‌فرض ۵ دقیقه
 	ChartWindowDur time.Duration // پنجره نمایش روی نمودار. 0 یعنی session
@@ -138,9 +139,12 @@ func loadConfig() (*Config, error) {
 		quickChart = "https://quickchart.io"
 	}
 
+	botUsername := strings.TrimPrefix(strings.TrimSpace(os.Getenv("TELEGRAM_BOT_USERNAME")), "@")
+
 	return &Config{
 		BotToken:       token,
 		ChannelID:      channel,
+		BotUsername:    botUsername,
 		Interval:       interval,
 		ChartInterval:  chartInterval,
 		ChartWindowDur: windowDur,
@@ -405,8 +409,9 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 	return b.String()
 }
 
-// sendToTelegram پیام را به کانال می‌فرستد
-func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text string) error {
+// sendToTelegram پیام را به کانال می‌فرستد. اگر replyMarkup خالی نباشد، به
+// عنوان مقدار خام reply_markup (JSON) به API ارسال می‌شود.
+func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text, replyMarkup string) error {
 	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.BotToken)
 
 	form := url.Values{}
@@ -414,6 +419,9 @@ func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text 
 	form.Set("text", text)
 	form.Set("parse_mode", "Markdown")
 	form.Set("disable_web_page_preview", "true")
+	if replyMarkup != "" {
+		form.Set("reply_markup", replyMarkup)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -432,6 +440,25 @@ func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text 
 		return fmt.Errorf("تلگرام کد %d برگرداند: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// convertButtonMarkup مارک‌آپ JSON برای دکمه inline «🔁 تبدیل» را می‌سازد.
+// اگر BotUsername تنظیم نشده باشد رشته خالی برمی‌گرداند تا دکمه پیوست نشود.
+func convertButtonMarkup(cfg *Config) string {
+	if cfg.BotUsername == "" {
+		return ""
+	}
+	markup := map[string]any{
+		"inline_keyboard": [][]map[string]string{{{
+			"text": "🔁 تبدیل",
+			"url":  "https://t.me/" + cfg.BotUsername + "?start=convert",
+		}}},
+	}
+	b, err := json.Marshal(markup)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // sendPhoto یک عکس PNG را به کانال تلگرام به‌صورت multipart می‌فرستد
@@ -473,6 +500,80 @@ func sendPhoto(ctx context.Context, client *http.Client, cfg *Config, pngBytes [
 		return fmt.Errorf("تلگرام (sendPhoto) کد %d برگرداند: %s", resp.StatusCode, string(buf))
 	}
 	return nil
+}
+
+// sendPrivate پیام مارک‌داون به chat_id دلخواه می‌فرستد. برای پاسخ‌های DM
+// مبدل ارز استفاده می‌شود. replyMarkup خالی یعنی بدون کیبورد inline.
+func sendPrivate(ctx context.Context, client *http.Client, cfg *Config, chatID int64, text, replyMarkup string) error {
+	api := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.BotToken)
+
+	form := url.Values{}
+	form.Set("chat_id", strconv.FormatInt(chatID, 10))
+	form.Set("text", text)
+	form.Set("parse_mode", "Markdown")
+	form.Set("disable_web_page_preview", "true")
+	if replyMarkup != "" {
+		form.Set("reply_markup", replyMarkup)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("تلگرام (sendPrivate) کد %d برگرداند: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// answerCallback اسپینر روی دکمه‌ی inline را پاک می‌کند
+func answerCallback(ctx context.Context, client *http.Client, cfg *Config, callbackID string) error {
+	api := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", cfg.BotToken)
+
+	form := url.Values{}
+	form.Set("callback_query_id", callbackID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// ratesCache آخرین نرخ USD→تومان را برای استفاده در تبدیل‌ها نگه می‌دارد
+type ratesCache struct {
+	mu        sync.Mutex
+	usdToman  float64
+	updatedAt time.Time
+}
+
+func (r *ratesCache) set(v float64) {
+	r.mu.Lock()
+	r.usdToman = v
+	r.updatedAt = time.Now()
+	r.mu.Unlock()
+}
+
+func (r *ratesCache) get() (float64, time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.usdToman, r.updatedAt
 }
 
 // sample یک نمونه از قیمت‌های همه ارزها در یک لحظه
@@ -890,7 +991,7 @@ func renderChartPNG(ctx context.Context, client *http.Client, baseURL string, sn
 }
 
 // runCycle یک چرخه کامل: دریافت قیمت + ارسال پیام متنی + ثبت در history
-func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history) {
+func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *history, rates *ratesCache) {
 	// timeout مستقل برای هر چرخه تا اگر شبکه کند بود، چرخه بعدی قفل نشود
 	cycleCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -916,11 +1017,13 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *histo
 	if err != nil {
 		log.Printf("⚠️ خطای دریافت قیمت دلار: %v", err)
 		usdToman = 0
+	} else if rates != nil && usdToman > 0 {
+		rates.set(usdToman)
 	}
 
 	msg := formatMessage(prices, usdToman)
 
-	if err := sendToTelegram(cycleCtx, client, cfg, msg); err != nil {
+	if err := sendToTelegram(cycleCtx, client, cfg, msg, convertButtonMarkup(cfg)); err != nil {
 		log.Printf("❌ خطای ارسال به تلگرام: %v", err)
 		return
 	}
@@ -980,6 +1083,346 @@ func runChartCycle(ctx context.Context, client *http.Client, cfg *Config, hist *
 	log.Printf("🖼️ نمودار ارسال شد — %d نمونه در پنجره", len(snap))
 }
 
+// ─── مبدل ارز ─────────────────────────────────────────────────────────────
+
+// currencyAlias نگاشت ورودی کاربر (لاتین/فارسی، حروف کوچک) به نماد استاندارد.
+// در init برای هر coin، Symbol آن هم اضافه می‌شود.
+var currencyAlias = map[string]string{
+	"usd": "USD", "dollar": "USD", "دلار": "USD",
+	"irr": "IRR", "rial": "IRR", "ریال": "IRR",
+	"toman": "TMN", "tmn": "TMN", "irt": "TMN", "تومان": "TMN",
+	"btc": "BTC", "bitcoin": "BTC", "بیتکوین": "BTC",
+	"eth": "ETH", "ethereum": "ETH", "اتریوم": "ETH",
+	"usdt": "USDT", "tether": "USDT", "تتر": "USDT",
+	"bnb": "BNB",
+	"xrp": "XRP", "ripple": "XRP",
+	"sol": "SOL", "solana": "SOL",
+	"doge": "DOGE", "dogecoin": "DOGE",
+	"xaut": "XAUT",
+	"paxg": "PAXG",
+	"slv":  "SLVON", "slvon": "SLVON", "نقره": "SLVON",
+	"wti": "WTI", "oil": "WTI", "نفت": "WTI",
+}
+
+// symToID نگاشت Symbol (مثل BTC) به CoinGecko ID (مثل bitcoin).
+var symToID = map[string]string{}
+
+func init() {
+	for _, c := range coins {
+		symToID[c.Symbol] = c.ID
+		currencyAlias[strings.ToLower(c.Symbol)] = c.Symbol
+	}
+}
+
+// normalizeDigits ارقام فارسی (۰-۹) و عربی (٠-٩) را به ASCII تبدیل می‌کند
+func normalizeDigits(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= '۰' && r <= '۹':
+			b.WriteRune(r - '۰' + '0')
+		case r >= '٠' && r <= '٩':
+			b.WriteRune(r - '٠' + '0')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// parseConversion ورودی متنی را به (مقدار، نماد مبدأ، نماد مقصد) تبدیل می‌کند.
+// نمونه‌های پشتیبانی‌شده: "100 usdt irr"، "100 usdt to irr"، "2.5 btc → toman"،
+// "5,000,000 toman btc"، "۱۰۰ usd toman".
+func parseConversion(text string) (amount float64, fromSym, toSym string, ok bool) {
+	s := normalizeDigits(text)
+	s = strings.ToLower(s)
+	// کاما و آندرسکور را از داخل عدد حذف کن (نه با space جایگزین کن، چون توکن می‌شکند)
+	s = strings.NewReplacer(",", "", "_", "").Replace(s)
+	// کانکتورهای جهت‌دار را با space جایگزین کن
+	s = strings.NewReplacer("→", " ", "←", " ", "⇒", " ", "=", " ", ">", " ", "<", " ").Replace(s)
+	tokens := strings.Fields(s)
+	filtered := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if t == "to" || t == "in" || t == "be" {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	if len(filtered) != 3 {
+		return 0, "", "", false
+	}
+	amt, err := strconv.ParseFloat(filtered[0], 64)
+	if err != nil || amt <= 0 {
+		return 0, "", "", false
+	}
+	from, ok1 := currencyAlias[filtered[1]]
+	to, ok2 := currencyAlias[filtered[2]]
+	if !ok1 || !ok2 {
+		return 0, "", "", false
+	}
+	return amt, from, to, true
+}
+
+// usdPer قیمت USD برای یک واحد از نماد می‌دهد.
+// USD → 1، TMN/IRR → از کَش نرخ، بقیه → از آخرین نمونه history.
+func usdPer(sym string, hist *history, rates *ratesCache) (float64, error) {
+	switch sym {
+	case "USD":
+		return 1.0, nil
+	case "TMN":
+		v, _ := rates.get()
+		if v <= 0 {
+			return 0, fmt.Errorf("نرخ دلار به تومان هنوز آماده نیست — چند ثانیه دیگر امتحان کنید")
+		}
+		return 1.0 / v, nil
+	case "IRR":
+		v, _ := rates.get()
+		if v <= 0 {
+			return 0, fmt.Errorf("نرخ دلار به تومان هنوز آماده نیست — چند ثانیه دیگر امتحان کنید")
+		}
+		return 1.0 / (v * 10), nil
+	default:
+		id, ok := symToID[sym]
+		if !ok {
+			return 0, fmt.Errorf("ارز %s پشتیبانی نمی‌شود", sym)
+		}
+		snap := hist.snapshot(0)
+		if len(snap) == 0 {
+			return 0, fmt.Errorf("داده قیمت هنوز جمع‌آوری نشده — چند ثانیه دیگر امتحان کنید")
+		}
+		p, ok := snap[len(snap)-1].prices[id]
+		if !ok || p <= 0 {
+			return 0, fmt.Errorf("قیمت %s در دسترس نیست", sym)
+		}
+		return p, nil
+	}
+}
+
+func convert(amount float64, fromSym, toSym string, hist *history, rates *ratesCache) (result, rate float64, err error) {
+	fromUSD, err := usdPer(fromSym, hist, rates)
+	if err != nil {
+		return 0, 0, err
+	}
+	toUSD, err := usdPer(toSym, hist, rates)
+	if err != nil {
+		return 0, 0, err
+	}
+	rate = fromUSD / toUSD
+	result = amount * rate
+	return result, rate, nil
+}
+
+// formatAmount عدد را با دقت مناسب نماد فرمت می‌کند
+func formatAmount(v float64, sym string) string {
+	switch sym {
+	case "USD":
+		return addThousandsSep(fmt.Sprintf("%.2f", v))
+	case "IRR", "TMN":
+		return addThousandsSep(fmt.Sprintf("%.0f", v))
+	default:
+		var s string
+		if v >= 1 {
+			s = fmt.Sprintf("%.4f", v)
+		} else {
+			s = fmt.Sprintf("%.8f", v)
+		}
+		if strings.Contains(s, ".") {
+			s = strings.TrimRight(s, "0")
+			s = strings.TrimRight(s, ".")
+		}
+		return addThousandsSep(s)
+	}
+}
+
+func formatConvertReply(amount float64, fromSym string, result float64, toSym string, rate float64) string {
+	return fmt.Sprintf(
+		"🔁 *تبدیل ارز*\n`%s %s`  →  `%s %s`\n\nنرخ: `1 %s ≈ %s %s`",
+		formatAmount(amount, fromSym), fromSym,
+		formatAmount(result, toSym), toSym,
+		fromSym,
+		formatAmount(rate, toSym), toSym,
+	)
+}
+
+const welcomeMessage = "سلام 👋\nهرچیزی را به هرچیزی تبدیل کن — کافیست متنش را بفرستی:\n\n" +
+	"`100 usdt irr`\n`2.5 btc toman`\n`5,000,000 toman btc`\n`1 eth usd`\n\n" +
+	"ارزها: btc, eth, usdt, bnb, xrp, sol, doge, xaut, paxg, slvon, wti\n" +
+	"فیات: usd, irr (ریال), tmn (تومان)"
+
+const usageHint = "متوجه نشدم 🤔 یک نمونه‌ی درست:\n\n" +
+	"`100 usdt irr`\n`2.5 btc toman`\n`1 eth usd`\n\n" +
+	"ارزها: btc, eth, usdt, bnb, xrp, sol, doge, xaut, paxg, slvon, wti\n" +
+	"فیات: usd, irr (ریال), tmn (تومان)"
+
+func quickKeyboardMarkup() string {
+	markup := map[string]any{
+		"inline_keyboard": [][]map[string]string{{
+			{"text": "1 USDT → IRR", "callback_data": "conv:1:USDT:IRR"},
+			{"text": "1 BTC → IRR", "callback_data": "conv:1:BTC:IRR"},
+			{"text": "1 BTC → USDT", "callback_data": "conv:1:BTC:USDT"},
+		}},
+	}
+	b, _ := json.Marshal(markup)
+	return string(b)
+}
+
+// tgUpdate شکل ساده‌شده‌ی آپدیت تلگرام — فقط فیلدهایی که نیاز داریم.
+type tgUpdate struct {
+	UpdateID int64 `json:"update_id"`
+	Message  *struct {
+		Chat struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
+		Text string `json:"text"`
+	} `json:"message"`
+	CallbackQuery *struct {
+		ID      string `json:"id"`
+		Data    string `json:"data"`
+		Message struct {
+			Chat struct {
+				ID int64 `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	} `json:"callback_query"`
+}
+
+// runUpdatesLoop با long-polling آپدیت‌ها را می‌گیرد و پاسخ تبدیل می‌فرستد.
+// خطاها فقط لاگ می‌شوند و حلقه ادامه پیدا می‌کند.
+func runUpdatesLoop(ctx context.Context, cfg *Config, hist *history, rates *ratesCache) {
+	poll := &http.Client{Timeout: 40 * time.Second}
+	var offset int64
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		endpoint := fmt.Sprintf(
+			"https://api.telegram.org/bot%s/getUpdates?timeout=30&offset=%d",
+			cfg.BotToken, offset,
+		)
+		reqCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			cancel()
+			log.Printf("⚠️ ساخت درخواست getUpdates شکست خورد: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		resp, err := poll.Do(req)
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("⚠️ خطای getUpdates: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			cancel()
+			log.Printf("⚠️ getUpdates کد %d: %s", resp.StatusCode, string(body))
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		var data struct {
+			Ok     bool       `json:"ok"`
+			Result []tgUpdate `json:"result"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			resp.Body.Close()
+			cancel()
+			log.Printf("⚠️ پارس پاسخ getUpdates شکست خورد: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		resp.Body.Close()
+		cancel()
+
+		for _, u := range data.Result {
+			if u.UpdateID >= offset {
+				offset = u.UpdateID + 1
+			}
+			handleUpdate(ctx, poll, cfg, hist, rates, u)
+		}
+	}
+}
+
+func handleUpdate(ctx context.Context, client *http.Client, cfg *Config, hist *history, rates *ratesCache, u tgUpdate) {
+	if u.CallbackQuery != nil {
+		cb := u.CallbackQuery
+		defer func() {
+			ackCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := answerCallback(ackCtx, client, cfg, cb.ID); err != nil {
+				log.Printf("⚠️ answerCallback: %v", err)
+			}
+		}()
+		parts := strings.Split(cb.Data, ":")
+		if len(parts) != 4 || parts[0] != "conv" {
+			return
+		}
+		amt, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil || amt <= 0 {
+			return
+		}
+		from, to := parts[2], parts[3]
+		replyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		result, rate, err := convert(amt, from, to, hist, rates)
+		var text string
+		if err != nil {
+			text = "❌ " + err.Error()
+		} else {
+			text = formatConvertReply(amt, from, result, to, rate)
+		}
+		if err := sendPrivate(replyCtx, client, cfg, cb.Message.Chat.ID, text, ""); err != nil {
+			log.Printf("⚠️ sendPrivate (callback): %v", err)
+		}
+		return
+	}
+
+	if u.Message == nil {
+		return
+	}
+	text := strings.TrimSpace(u.Message.Text)
+	if text == "" {
+		return
+	}
+	chatID := u.Message.Chat.ID
+
+	replyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	if strings.HasPrefix(text, "/start") {
+		if err := sendPrivate(replyCtx, client, cfg, chatID, welcomeMessage, quickKeyboardMarkup()); err != nil {
+			log.Printf("⚠️ sendPrivate (/start): %v", err)
+		}
+		return
+	}
+
+	amount, from, to, ok := parseConversion(text)
+	if !ok {
+		if err := sendPrivate(replyCtx, client, cfg, chatID, usageHint, ""); err != nil {
+			log.Printf("⚠️ sendPrivate (usage): %v", err)
+		}
+		return
+	}
+	result, rate, err := convert(amount, from, to, hist, rates)
+	var reply string
+	if err != nil {
+		reply = "❌ " + err.Error()
+	} else {
+		reply = formatConvertReply(amount, from, result, to, rate)
+	}
+	if err := sendPrivate(replyCtx, client, cfg, chatID, reply, ""); err != nil {
+		log.Printf("⚠️ sendPrivate (conv): %v", err)
+	}
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -988,6 +1431,7 @@ func main() {
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	hist := &history{maxAge: cfg.ChartWindowDur}
+	rates := &ratesCache{}
 
 	// graceful shutdown با Ctrl+C یا SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -997,9 +1441,10 @@ func main() {
 		cfg.Interval, cfg.SampleInterval, cfg.ChartInterval, cfg.ChartWindowRaw, cfg.ChannelID)
 
 	// اولین چرخه متن را بلافاصله بفرست (هم history را پر می‌کند هم پیام را)
-	runCycle(ctx, client, cfg, hist)
+	runCycle(ctx, client, cfg, hist, rates)
 
 	// goroutine مستقل برای نمونه‌گیری سریع (بدون ارسال) — تا نمودار داده کافی داشته باشد
+	// و نرخ USD→تومان هم برای مبدل تازه بماند حتی اگر INTERVAL متن طولانی باشد.
 	go func() {
 		tk := time.NewTicker(cfg.SampleInterval)
 		defer tk.Stop()
@@ -1019,6 +1464,12 @@ func main() {
 					prices["wti-perp"] = wti
 				}
 				recordSample(hist, prices)
+				// اگر نرخ دلار قدیمی‌تر از ۶۰ ثانیه است، تازه‌اش کن (Bonbast گران است)
+				if _, t := rates.get(); time.Since(t) > 60*time.Second {
+					if v, err := fetchUSDInToman(sampleCtx, client); err == nil && v > 0 {
+						rates.set(v)
+					}
+				}
 				cancel()
 			}
 		}
@@ -1038,6 +1489,9 @@ func main() {
 		}
 	}()
 
+	// goroutine مستقل برای دریافت پیام‌های خصوصی و پاسخ تبدیل ارز
+	go runUpdatesLoop(ctx, cfg, hist, rates)
+
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
@@ -1047,7 +1501,7 @@ func main() {
 			log.Println("🛑 سیگنال خاتمه دریافت شد، خروج تمیز...")
 			return
 		case <-ticker.C:
-			runCycle(ctx, client, cfg, hist)
+			runCycle(ctx, client, cfg, hist, rates)
 		}
 	}
 }
