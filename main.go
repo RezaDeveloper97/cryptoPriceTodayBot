@@ -468,13 +468,13 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 		if !ok {
 			continue
 		}
-		sign := "🟢"
+		sign := "🟢 ▲"
 		if p.Change24h < 0 {
-			sign = "🔴"
+			sign = "🔴 ▼"
 		}
 		fmt.Fprintf(&b,
-			"%s *%s* `$%s` %s `%+.2f%%`\n",
-			c.Emoji, c.Symbol,
+			"%s *%s* `%s`\n   `$%s`  %s `%+.2f%%`\n",
+			c.Emoji, c.Name, c.Symbol,
 			formatPrice(p.USD), sign, p.Change24h,
 		)
 	}
@@ -495,7 +495,7 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 		loc = time.UTC
 	}
 	fmt.Fprintf(&b,
-		"🕐 %s (Tehran) · _CoinGecko · Nobitex_",
+		"🕐 %s (Tehran)\n_Sources: CoinGecko · Nobitex_",
 		time.Now().In(loc).Format("2006-01-02 15:04:05"),
 	)
 	return b.String()
