@@ -615,7 +615,6 @@ func formatFiatBlock(fiat map[string]float64) string {
 		return s
 	}
 	var b strings.Builder
-	b.WriteString("💱 نرخ ارز (تومان)\n")
 	b.WriteString("💱 Exchange Rates (Toman)\n")
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	for i := 0; i < len(entries); i += 2 {
