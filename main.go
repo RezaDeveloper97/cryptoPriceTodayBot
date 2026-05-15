@@ -391,40 +391,103 @@ const bonbastUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 // قالب: param: "TOKEN,CSRF,TIMESTAMP"
 var bonbastParamRe = regexp.MustCompile(`param:\s*"([^"]+)"`)
 
-// fetchUSDInToman قیمت لحظه‌ای دلار آمریکا به تومان را از bonbast.com (بازار آزاد ایران)
-// می‌گیرد. روال: GET صفحه اصلی برای دریافت پارامتر CSRF و کوکی، سپس POST به /json.
-// مقدار usd1 (قیمت فروش) که bonbast به تومان برمی‌گرداند را پارس می‌کند.
-func fetchUSDInToman(ctx context.Context, baseClient *http.Client) (float64, error) {
+// fiatCurrency متادیتای یک ارز فیات قابل دریافت از bonbast.
+// PerUnit واحد قیمت‌گذاری bonbast (مثلاً JPY=100 یعنی نرخ به‌ازای ۱۰۰ ین داده می‌شود).
+type fiatCurrency struct {
+	Symbol  string
+	Field   string
+	FaName  string
+	Flag    string
+	PerUnit float64
+}
+
+// fiatCurrencies ترتیب نمایش در پیام کانال را هم تعیین می‌کند.
+var fiatCurrencies = []fiatCurrency{
+	{"EUR", "eur1", "یورو", "🇪🇺", 1},
+	{"GBP", "gbp1", "پوند", "🇬🇧", 1},
+	{"AED", "aed1", "درهم", "🇦🇪", 1},
+	{"TRY", "try1", "لیر", "🇹🇷", 1},
+	{"CAD", "cad1", "دلار کانادا", "🇨🇦", 1},
+	{"CHF", "chf1", "فرانک", "🇨🇭", 1},
+	{"AUD", "aud1", "دلار استرالیا", "🇦🇺", 1},
+	{"JPY", "jpy1", "ین", "🇯🇵", 100},
+	{"CNY", "cny1", "یوان", "🇨🇳", 1},
+	{"RUB", "rub1", "روبل", "🇷🇺", 1},
+	{"SEK", "sek1", "کرون سوئد", "🇸🇪", 1},
+	{"NOK", "nok1", "کرون نروژ", "🇳🇴", 1},
+	{"DKK", "dkk1", "کرون دانمارک", "🇩🇰", 1},
+	{"SGD", "sgd1", "دلار سنگاپور", "🇸🇬", 1},
+	{"HKD", "hkd1", "دلار هنگ‌کنگ", "🇭🇰", 1},
+	{"INR", "inr1", "روپیه", "🇮🇳", 1},
+	{"MYR", "myr1", "رینگیت", "🇲🇾", 1},
+	{"THB", "thb1", "بات", "🇹🇭", 1},
+	{"KRW", "krw1", "وون", "🇰🇷", 1},
+	{"AZN", "azn1", "منات آذربایجان", "🇦🇿", 1},
+	{"AMD", "amd1", "درام", "🇦🇲", 1},
+	{"GEL", "gel1", "لاری", "🇬🇪", 1},
+	{"IQD", "iqd1", "دینار عراق", "🇮🇶", 1},
+	{"AFN", "afn1", "افغانی", "🇦🇫", 1},
+	{"BHD", "bhd1", "دینار بحرین", "🇧🇭", 1},
+	{"OMR", "omr1", "ریال عمان", "🇴🇲", 1},
+	{"QAR", "qar1", "ریال قطر", "🇶🇦", 1},
+	{"KWD", "kwd1", "دینار کویت", "🇰🇼", 1},
+}
+
+// parseBonbastFloat یک فیلد پاسخ bonbast (که معمولاً string با کاما) را به float
+// تبدیل می‌کند. اگر مقدار خالی/غیرعدد بود، ok=false برمی‌گرداند.
+func parseBonbastFloat(raw any) (float64, bool) {
+	s, ok := raw.(string)
+	if !ok {
+		return 0, false
+	}
+	s = strings.ReplaceAll(s, ",", "")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// fetchFiatRates نرخ لحظه‌ای دلار + سایر ارزهای فیات تعریف‌شده در fiatCurrencies
+// را از bonbast.com (بازار آزاد ایران) می‌گیرد. روال: GET صفحه اصلی برای دریافت
+// پارامتر CSRF و کوکی، سپس POST به /json. تمام مقادیر به تومان هستند (و برای
+// JPY پس از تقسیم بر ۱۰۰ به ازای یک واحد نرمالایز می‌شود).
+// شکست در دریافت usd1 → خطا. شکست در سایر ارزها → لاگ هشدار و رد شدن (fail-soft).
+func fetchFiatRates(ctx context.Context, baseClient *http.Client) (float64, map[string]float64, error) {
 	// کوکی‌جار محلی برای هر فراخوانی، چون پارامتر صفحه و کوکی‌اش با هم گره خورده‌اند
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	client := &http.Client{Timeout: baseClient.Timeout, Jar: jar}
 
 	homeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.bonbast.com/", nil)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	homeReq.Header.Set("User-Agent", bonbastUserAgent)
 	homeReq.Header.Set("Accept", "text/html")
 
 	homeResp, err := client.Do(homeReq)
 	if err != nil {
-		return 0, fmt.Errorf("درخواست صفحه bonbast شکست خورد: %w", err)
+		return 0, nil, fmt.Errorf("درخواست صفحه bonbast شکست خورد: %w", err)
 	}
 	defer homeResp.Body.Close()
 	if homeResp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("کد وضعیت bonbast %d", homeResp.StatusCode)
+		return 0, nil, fmt.Errorf("کد وضعیت bonbast %d", homeResp.StatusCode)
 	}
 	html, err := io.ReadAll(io.LimitReader(homeResp.Body, 1<<20))
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	m := bonbastParamRe.FindSubmatch(html)
 	if len(m) < 2 {
-		return 0, fmt.Errorf("پارامتر bonbast در HTML پیدا نشد")
+		return 0, nil, fmt.Errorf("پارامتر bonbast در HTML پیدا نشد")
 	}
 	param := string(m[1])
 
@@ -432,7 +495,7 @@ func fetchUSDInToman(ctx context.Context, baseClient *http.Client) (float64, err
 	form.Set("param", param)
 	jsonReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://www.bonbast.com/json", strings.NewReader(form.Encode()))
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	jsonReq.Header.Set("User-Agent", bonbastUserAgent)
 	jsonReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -443,39 +506,89 @@ func fetchUSDInToman(ctx context.Context, baseClient *http.Client) (float64, err
 
 	jsonResp, err := client.Do(jsonReq)
 	if err != nil {
-		return 0, fmt.Errorf("درخواست JSON bonbast شکست خورد: %w", err)
+		return 0, nil, fmt.Errorf("درخواست JSON bonbast شکست خورد: %w", err)
 	}
 	defer jsonResp.Body.Close()
 	if jsonResp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("کد وضعیت bonbast/json %d", jsonResp.StatusCode)
+		return 0, nil, fmt.Errorf("کد وضعیت bonbast/json %d", jsonResp.StatusCode)
 	}
 
 	var data map[string]any
 	if err := json.NewDecoder(jsonResp.Body).Decode(&data); err != nil {
-		return 0, fmt.Errorf("پارس JSON bonbast شکست خورد: %w", err)
+		return 0, nil, fmt.Errorf("پارس JSON bonbast شکست خورد: %w", err)
 	}
 
 	if _, expired := data["reset"]; expired {
-		return 0, fmt.Errorf("نشست bonbast منقضی شد (reset=1)")
+		return 0, nil, fmt.Errorf("نشست bonbast منقضی شد (reset=1)")
 	}
 
 	usdRaw, ok := data["usd1"]
 	if !ok {
-		return 0, fmt.Errorf("فیلد usd1 در پاسخ bonbast نبود")
+		return 0, nil, fmt.Errorf("فیلد usd1 در پاسخ bonbast نبود")
 	}
-	usdStr, ok := usdRaw.(string)
+	usdToman, ok := parseBonbastFloat(usdRaw)
 	if !ok {
-		return 0, fmt.Errorf("نوع usd1 در پاسخ bonbast غیرمنتظره: %T", usdRaw)
+		return 0, nil, fmt.Errorf("قیمت دلار bonbast نامعتبر: %v", usdRaw)
 	}
-	toman, err := strconv.ParseFloat(strings.ReplaceAll(usdStr, ",", ""), 64)
-	if err != nil {
-		return 0, fmt.Errorf("قیمت دلار bonbast نامعتبر: %w", err)
+
+	fiat := make(map[string]float64, len(fiatCurrencies))
+	for _, f := range fiatCurrencies {
+		raw, exists := data[f.Field]
+		if !exists {
+			log.Printf("⚠️ نرخ %s در پاسخ bonbast نبود", f.Symbol)
+			continue
+		}
+		v, ok := parseBonbastFloat(raw)
+		if !ok {
+			log.Printf("⚠️ نرخ %s در پاسخ bonbast نامعتبر: %v", f.Symbol, raw)
+			continue
+		}
+		perUnit := f.PerUnit
+		if perUnit <= 0 {
+			perUnit = 1
+		}
+		fiat[f.Symbol] = v / perUnit
 	}
-	return toman, nil
+
+	return usdToman, fiat, nil
+}
+
+// formatFiatBlock بلاک «نرخ ارز» برای پیام کانال را می‌سازد — ۲ ستون،
+// به ترتیب fiatCurrencies. اگر داده‌ای موجود نباشد رشته خالی برمی‌گرداند.
+func formatFiatBlock(fiat map[string]float64) string {
+	if len(fiat) == 0 {
+		return ""
+	}
+	var rows []string
+	for _, f := range fiatCurrencies {
+		v, ok := fiat[f.Symbol]
+		if !ok || v <= 0 {
+			continue
+		}
+		rows = append(rows, fmt.Sprintf(
+			"%s %s %s",
+			f.Flag, f.Symbol,
+			addThousandsSep(fmt.Sprintf("%.0f", v)),
+		))
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	b.WriteString("💱 نرخ ارز (تومان)\n")
+	for i := 0; i < len(rows); i += 2 {
+		if i+1 < len(rows) {
+			fmt.Fprintf(&b, "%s   %s\n", rows[i], rows[i+1])
+		} else {
+			fmt.Fprintf(&b, "%s\n", rows[i])
+		}
+	}
+	return b.String()
 }
 
 // formatMessage پیام نهایی Markdown را می‌سازد
-func formatMessage(prices map[string]priceInfo, usdToman float64) string {
+func formatMessage(prices map[string]priceInfo, usdToman float64, fiat map[string]float64) string {
 	var b strings.Builder
 	b.WriteString("📊 Live Crypto Prices\n")
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
@@ -506,6 +619,8 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 		b.WriteString("💵 USD/IRR unavailable\n")
 	}
 
+	b.WriteString(formatFiatBlock(fiat))
+
 	// زمان به وقت تهران
 	loc, err := time.LoadLocation("Asia/Tehran")
 	if err != nil {
@@ -529,7 +644,7 @@ func formatLatestPrices(hist *history, rates *ratesCache) string {
 	}
 	last := snap[len(snap)-1]
 	usdToman, _ := rates.get()
-	return formatMessage(last.prices, usdToman)
+	return formatMessage(last.prices, usdToman, rates.snapshotFiat())
 }
 
 // sendToTelegram پیام را به کانال می‌فرستد. اگر replyMarkup خالی نباشد، به
@@ -687,16 +802,19 @@ func answerCallback(ctx context.Context, client *http.Client, cfg *Config, callb
 	return nil
 }
 
-// ratesCache آخرین نرخ USD→تومان را برای استفاده در تبدیل‌ها نگه می‌دارد
+// ratesCache آخرین نرخ USD→تومان و سایر ارزهای فیات را برای استفاده در تبدیل‌ها
+// و پیام کانال نگه می‌دارد. مقادیر fiat به ازای ۱ واحد (پس از نرمال‌سازی JPY).
 type ratesCache struct {
 	mu        sync.Mutex
 	usdToman  float64
+	fiat      map[string]float64
 	updatedAt time.Time
 }
 
-func (r *ratesCache) set(v float64) {
+func (r *ratesCache) set(usd float64, fiat map[string]float64) {
 	r.mu.Lock()
-	r.usdToman = v
+	r.usdToman = usd
+	r.fiat = fiat
 	r.updatedAt = time.Now()
 	r.mu.Unlock()
 }
@@ -705,6 +823,26 @@ func (r *ratesCache) get() (float64, time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.usdToman, r.updatedAt
+}
+
+func (r *ratesCache) getFiat(sym string) (float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.fiat[sym]
+	return v, ok && v > 0
+}
+
+func (r *ratesCache) snapshotFiat() map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.fiat) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(r.fiat))
+	for k, v := range r.fiat {
+		out[k] = v
+	}
+	return out
 }
 
 // livePriceCache قیمت زنده ارزهای غیرردیابی‌شده را برای مدتی نگه می‌دارد
@@ -1185,15 +1323,16 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *histo
 	recordSample(hist, prices)
 
 	// قیمت دلار اختیاری است؛ اگر شکست خورد پیام را بدون آن می‌فرستیم
-	usdToman, err := fetchUSDInToman(cycleCtx, client)
+	usdToman, fiatRates, err := fetchFiatRates(cycleCtx, client)
 	if err != nil {
-		log.Printf("⚠️ خطای دریافت قیمت دلار: %v", err)
+		log.Printf("⚠️ خطای دریافت نرخ‌های ارز: %v", err)
 		usdToman = 0
+		fiatRates = nil
 	} else if rates != nil && usdToman > 0 {
-		rates.set(usdToman)
+		rates.set(usdToman, fiatRates)
 	}
 
-	msg := formatMessage(prices, usdToman)
+	msg := formatMessage(prices, usdToman, fiatRates)
 
 	if err := sendToTelegram(cycleCtx, client, cfg, msg, messageButtonsMarkup(cfg)); err != nil {
 		log.Printf("❌ خطای ارسال به تلگرام: %v", err)
@@ -1258,6 +1397,36 @@ var currencyAlias = map[string]string{
 	"paxg": "PAXG",
 	"slv":  "SLVON", "slvon": "SLVON", "نقره": "SLVON",
 	"wti": "WTI", "oil": "WTI", "نفت": "WTI",
+
+	// فیات‌های bonbast
+	"eur": "EUR", "euro": "EUR", "یورو": "EUR",
+	"gbp": "GBP", "pound": "GBP", "پوند": "GBP",
+	"aed": "AED", "dirham": "AED", "درهم": "AED",
+	"try": "TRY", "lira": "TRY", "لیر": "TRY",
+	"cad": "CAD", "دلار کانادا": "CAD",
+	"chf": "CHF", "franc": "CHF", "فرانک": "CHF",
+	"aud": "AUD", "دلار استرالیا": "AUD",
+	"jpy": "JPY", "yen": "JPY", "ین": "JPY",
+	"cny": "CNY", "yuan": "CNY", "یوان": "CNY",
+	"rub": "RUB", "ruble": "RUB", "روبل": "RUB",
+	"sek": "SEK", "کرون سوئد": "SEK",
+	"nok": "NOK", "کرون نروژ": "NOK",
+	"dkk": "DKK", "کرون دانمارک": "DKK",
+	"sgd": "SGD", "دلار سنگاپور": "SGD",
+	"hkd": "HKD", "دلار هنگ‌کنگ": "HKD",
+	"inr": "INR", "rupee": "INR", "روپیه": "INR",
+	"myr": "MYR", "ringgit": "MYR", "رینگیت": "MYR",
+	"thb": "THB", "baht": "THB", "بات": "THB",
+	"krw": "KRW", "won": "KRW", "وون": "KRW",
+	"azn": "AZN", "منات": "AZN",
+	"amd": "AMD", "dram": "AMD", "درام": "AMD",
+	"gel": "GEL", "lari": "GEL", "لاری": "GEL",
+	"iqd": "IQD", "دینار عراق": "IQD",
+	"afn": "AFN", "افغانی": "AFN",
+	"bhd": "BHD", "دینار بحرین": "BHD",
+	"omr": "OMR", "ریال عمان": "OMR",
+	"qar": "QAR", "ریال قطر": "QAR",
+	"kwd": "KWD", "دینار کویت": "KWD",
 }
 
 // symToID نگاشت Symbol (مثل BTC) به CoinGecko ID (مثل bitcoin).
@@ -1340,6 +1509,14 @@ func usdPer(ctx context.Context, sym string, deps *convDeps) (float64, error) {
 		}
 		return 1.0 / (v * 10), nil
 	default:
+		// مرحله ۰: فیات‌های bonbast — تومانی هستند، با تقسیم بر نرخ دلار به USD می‌رسیم
+		if toman, ok := deps.rates.getFiat(sym); ok {
+			usd, _ := deps.rates.get()
+			if usd <= 0 {
+				return 0, fmt.Errorf("نرخ دلار هنوز آماده نیست — چند ثانیه دیگر امتحان کنید")
+			}
+			return toman / usd, nil
+		}
 		id, ok := symToID[sym]
 		if !ok {
 			return 0, fmt.Errorf("ارز %s پشتیبانی نمی‌شود", sym)
