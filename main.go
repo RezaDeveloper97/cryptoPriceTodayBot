@@ -518,6 +518,66 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 	return b.String()
 }
 
+// formatLivePopup یک خلاصه‌ی فشرده از قیمت‌ها برای پاپ‌آپ answerCallbackQuery
+// برمی‌گرداند. محدودیت text در answerCallbackQuery ۲۰۰ کاراکتر است، پس عمداً
+// خلاصه‌سازی شده: فقط نماد + قیمت دلاری فشرده (K برای ≥۱۰۰۰) + درصد ۲۴ ساعته.
+// هیچ درخواست API نمی‌زند — همه‌چیز از آخرین نمونه history و ratesCache می‌آید
+// (هر دو توسط runCycle هر INTERVAL تازه می‌شوند). در عمل قیمت‌ها حداکثر یک
+// چرخه قدیمی‌ترند — برای کاربری که از روی پیام فوروارد شده «⚡ لایو» می‌زند کافی است.
+func formatLivePopup(hist *history, rates *ratesCache) string {
+	snap := hist.snapshot(0)
+	if len(snap) == 0 {
+		return "هنوز قیمتی در دسترس نیست — چند ثانیه دیگر دوباره امتحان کن"
+	}
+	last := snap[len(snap)-1]
+
+	var b strings.Builder
+	for _, c := range coins {
+		p, ok := last.prices[c.ID]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, "%s %s %+.1f%%\n",
+			c.Symbol,
+			formatCompactPrice(p.USD),
+			p.Change24h,
+		)
+	}
+	if v, _ := rates.get(); v > 0 {
+		fmt.Fprintf(&b, "1$≈%sT", addThousandsSep(fmt.Sprintf("%.0f", v)))
+	}
+
+	s := b.String()
+	// محدودیت تلگرام بر اساس rune است (نه byte). در عمل خروجی ≤۲۰۰ است اما
+	// اگر در آینده ارز اضافه شد یا مقادیر استثنایی پیش آمد، با حفظ ساختار از
+	// انتها برش بزن تا API ۴۰۰ نگیرد.
+	if len([]rune(s)) > 200 {
+		r := []rune(s)
+		s = string(r[:200])
+	}
+	return s
+}
+
+// formatCompactPrice قیمت دلاری را در حداقل تعداد کاراکتر فرمت می‌کند:
+// ≥۱۰۰۰ → "K"، ≥۱۰۰ → بدون اعشار، ۱..۱۰۰ → یک رقم، <۱ → اعشار بیشتر.
+// بدون $ چون پاپ‌آپ تنگ است و کانتکست از پیام اصلی روشن است.
+func formatCompactPrice(v float64) string {
+	switch {
+	case v >= 1000:
+		return fmt.Sprintf("%.1fK", v/1000)
+	case v >= 100:
+		return fmt.Sprintf("%.0f", v)
+	case v >= 1:
+		return fmt.Sprintf("%.1f", v)
+	case v >= 0.1:
+		return fmt.Sprintf("%.2f", v)
+	case v >= 0.01:
+		return fmt.Sprintf("%.3f", v)
+	default:
+		return fmt.Sprintf("%.4f", v)
+	}
+}
+
 // sendToTelegram پیام را به کانال می‌فرستد. اگر replyMarkup خالی نباشد، به
 // عنوان مقدار خام reply_markup (JSON) به API ارسال می‌شود.
 func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text, replyMarkup string) error {
@@ -551,17 +611,23 @@ func sendToTelegram(ctx context.Context, client *http.Client, cfg *Config, text,
 	return nil
 }
 
-// convertButtonMarkup مارک‌آپ JSON برای دکمه inline «🔁 تبدیل» را می‌سازد.
-// اگر BotUsername تنظیم نشده باشد رشته خالی برمی‌گرداند تا دکمه پیوست نشود.
-func convertButtonMarkup(cfg *Config) string {
-	if cfg.BotUsername == "" {
-		return ""
+// messageButtonsMarkup مارک‌آپ JSON برای دکمه‌های inline زیر پیام را می‌سازد:
+//   - «⚡ لایو» (callback_data=live): پاپ‌آپ با قیمت‌های لحظه‌ای — همیشه فعال،
+//     چون از طریق callback_query کار می‌کند و حتی روی پیام‌های فوروارد شده هم
+//     مستقیماً به همین ربات وصل می‌شود.
+//   - «🔁 تبدیل» (URL deep-link): فقط اگر BotUsername تنظیم شده باشد پیوست می‌شود.
+func messageButtonsMarkup(cfg *Config) string {
+	row := []map[string]string{
+		{"text": "⚡ لایو", "callback_data": "live"},
 	}
-	markup := map[string]any{
-		"inline_keyboard": [][]map[string]string{{{
+	if cfg.BotUsername != "" {
+		row = append(row, map[string]string{
 			"text": "🔁 تبدیل",
 			"url":  "https://t.me/" + cfg.BotUsername + "?start=convert",
-		}}},
+		})
+	}
+	markup := map[string]any{
+		"inline_keyboard": [][]map[string]string{row},
 	}
 	b, err := json.Marshal(markup)
 	if err != nil {
@@ -644,12 +710,20 @@ func sendPrivate(ctx context.Context, client *http.Client, cfg *Config, chatID i
 	return nil
 }
 
-// answerCallback اسپینر روی دکمه‌ی inline را پاک می‌کند
-func answerCallback(ctx context.Context, client *http.Client, cfg *Config, callbackID string) error {
+// answerCallback اسپینر روی دکمه‌ی inline را پاک می‌کند. اگر text داده شود،
+// تلگرام یک toast (یا با showAlert=true یک پاپ‌آپ مودال) به کاربر نشان می‌دهد.
+// محدودیت text حداکثر ۲۰۰ کاراکتر است.
+func answerCallback(ctx context.Context, client *http.Client, cfg *Config, callbackID, text string, showAlert bool) error {
 	api := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", cfg.BotToken)
 
 	form := url.Values{}
 	form.Set("callback_query_id", callbackID)
+	if text != "" {
+		form.Set("text", text)
+	}
+	if showAlert {
+		form.Set("show_alert", "true")
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, api, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -1173,7 +1247,7 @@ func runCycle(ctx context.Context, client *http.Client, cfg *Config, hist *histo
 
 	msg := formatMessage(prices, usdToman)
 
-	if err := sendToTelegram(cycleCtx, client, cfg, msg, convertButtonMarkup(cfg)); err != nil {
+	if err := sendToTelegram(cycleCtx, client, cfg, msg, messageButtonsMarkup(cfg)); err != nil {
 		log.Printf("❌ خطای ارسال به تلگرام: %v", err)
 		return
 	}
@@ -1500,10 +1574,25 @@ func runUpdatesLoop(ctx context.Context, cfg *Config, deps *convDeps) {
 func handleUpdate(ctx context.Context, cfg *Config, deps *convDeps, u tgUpdate) {
 	if u.CallbackQuery != nil {
 		cb := u.CallbackQuery
+
+		// دکمه «⚡ لایو» روی پیام کانال (یا فوروارد آن): پاپ‌آپ مودال با
+		// قیمت‌های لحظه‌ای. هیچ پیامی به DM فرستاده نمی‌شود — پاسخ کاملاً
+		// داخل خود answerCallbackQuery است، پس کاربر نیازی به استارت کردن
+		// ربات ندارد و حتی روی پیام فوروارد شده هم کار می‌کند.
+		if cb.Data == "live" {
+			ackCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			popup := formatLivePopup(deps.hist, deps.rates)
+			if err := answerCallback(ackCtx, deps.client, cfg, cb.ID, popup, true); err != nil {
+				log.Printf("⚠️ answerCallback (live): %v", err)
+			}
+			return
+		}
+
 		defer func() {
 			ackCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			if err := answerCallback(ackCtx, deps.client, cfg, cb.ID); err != nil {
+			if err := answerCallback(ackCtx, deps.client, cfg, cb.ID, "", false); err != nil {
 				log.Printf("⚠️ answerCallback: %v", err)
 			}
 		}()
