@@ -605,21 +605,27 @@ func formatFiatBlock(fiat map[string]float64) string {
 	if len(entries) == 0 {
 		return ""
 	}
+	// U+2007 (FIGURE SPACE) عرضش با یک رقم برابره؛ برای تراز اعداد در متن
+	// غیر-monospace استفاده می‌شه تا ستون دوم در همه ردیف‌ها زیر هم بیفته.
+	const figSpace = " "
+	pad := func(s string) string {
+		if d := maxValLen - len(s); d > 0 {
+			return strings.Repeat(figSpace, d) + s
+		}
+		return s
+	}
 	var b strings.Builder
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	b.WriteString("💱 نرخ ارز (تومان)\n")
-	// بلاک کد monospace تا ستون‌ها زیر هم تراز شن (در Markdown قدیمی تلگرام).
-	b.WriteString("```\n")
 	for i := 0; i < len(entries); i += 2 {
-		left := fmt.Sprintf("%s %s %*s", entries[i].flag, entries[i].sym, maxValLen, entries[i].val)
+		left := fmt.Sprintf("%s %s %s", entries[i].flag, entries[i].sym, pad(entries[i].val))
 		if i+1 < len(entries) {
-			right := fmt.Sprintf("%s %s %*s", entries[i+1].flag, entries[i+1].sym, maxValLen, entries[i+1].val)
-			fmt.Fprintf(&b, "%s  %s\n", left, right)
+			right := fmt.Sprintf("%s %s %s", entries[i+1].flag, entries[i+1].sym, pad(entries[i+1].val))
+			fmt.Fprintf(&b, "%s   %s\n", left, right)
 		} else {
 			fmt.Fprintf(&b, "%s\n", left)
 		}
 	}
-	b.WriteString("```\n")
 	return b.String()
 }
 
