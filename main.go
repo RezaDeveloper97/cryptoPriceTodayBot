@@ -391,46 +391,53 @@ const bonbastUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 // قالب: param: "TOKEN,CSRF,TIMESTAMP"
 var bonbastParamRe = regexp.MustCompile(`param:\s*"([^"]+)"`)
 
+// regex برای استخراج ضریب واحد ارز از HTML. ساختار ردیف bonbast:
+//
+//	alt="AMD" ... />AMD</a></td><td><sup class="miladi">10</sup>Armenian Dram
+//
+// عدد داخل <sup class="miladi"> یعنی نرخ به‌ازای آن تعداد واحد داده شده
+// (مثلاً IQD=100 یعنی قیمت به ازای ۱۰۰ دینار است → باید بر ۱۰۰ تقسیم شود).
+// قید [^>]* بعد از alt جلوی نشت به ردیف بعدی را می‌گیرد.
+var bonbastPerUnitRe = regexp.MustCompile(`alt="([A-Z]{3})"[^>]*>[A-Z]{3}</a></td><td><sup class="miladi">(\d+)</sup>`)
+
 // fiatCurrency متادیتای یک ارز فیات قابل دریافت از bonbast.
-// PerUnit واحد قیمت‌گذاری bonbast (مثلاً JPY=100 یعنی نرخ به‌ازای ۱۰۰ ین داده می‌شود).
 type fiatCurrency struct {
-	Symbol  string
-	Field   string
-	FaName  string
-	Flag    string
-	PerUnit float64
+	Symbol string
+	Field  string
+	FaName string
+	Flag   string
 }
 
 // fiatCurrencies ترتیب نمایش در پیام کانال را هم تعیین می‌کند.
 var fiatCurrencies = []fiatCurrency{
-	{"EUR", "eur1", "یورو", "🇪🇺", 1},
-	{"GBP", "gbp1", "پوند", "🇬🇧", 1},
-	{"AED", "aed1", "درهم", "🇦🇪", 1},
-	{"TRY", "try1", "لیر", "🇹🇷", 1},
-	{"CAD", "cad1", "دلار کانادا", "🇨🇦", 1},
-	{"CHF", "chf1", "فرانک", "🇨🇭", 1},
-	{"AUD", "aud1", "دلار استرالیا", "🇦🇺", 1},
-	{"JPY", "jpy1", "ین", "🇯🇵", 100},
-	{"CNY", "cny1", "یوان", "🇨🇳", 1},
-	{"RUB", "rub1", "روبل", "🇷🇺", 1},
-	{"SEK", "sek1", "کرون سوئد", "🇸🇪", 1},
-	{"NOK", "nok1", "کرون نروژ", "🇳🇴", 1},
-	{"DKK", "dkk1", "کرون دانمارک", "🇩🇰", 1},
-	{"SGD", "sgd1", "دلار سنگاپور", "🇸🇬", 1},
-	{"HKD", "hkd1", "دلار هنگ‌کنگ", "🇭🇰", 1},
-	{"INR", "inr1", "روپیه", "🇮🇳", 1},
-	{"MYR", "myr1", "رینگیت", "🇲🇾", 1},
-	{"THB", "thb1", "بات", "🇹🇭", 1},
-	{"KRW", "krw1", "وون", "🇰🇷", 1},
-	{"AZN", "azn1", "منات آذربایجان", "🇦🇿", 1},
-	{"AMD", "amd1", "درام", "🇦🇲", 1},
-	{"GEL", "gel1", "لاری", "🇬🇪", 1},
-	{"IQD", "iqd1", "دینار عراق", "🇮🇶", 1},
-	{"AFN", "afn1", "افغانی", "🇦🇫", 1},
-	{"BHD", "bhd1", "دینار بحرین", "🇧🇭", 1},
-	{"OMR", "omr1", "ریال عمان", "🇴🇲", 1},
-	{"QAR", "qar1", "ریال قطر", "🇶🇦", 1},
-	{"KWD", "kwd1", "دینار کویت", "🇰🇼", 1},
+	{"EUR", "eur1", "یورو", "🇪🇺"},
+	{"GBP", "gbp1", "پوند", "🇬🇧"},
+	{"AED", "aed1", "درهم", "🇦🇪"},
+	{"TRY", "try1", "لیر", "🇹🇷"},
+	{"CAD", "cad1", "دلار کانادا", "🇨🇦"},
+	{"CHF", "chf1", "فرانک", "🇨🇭"},
+	{"AUD", "aud1", "دلار استرالیا", "🇦🇺"},
+	{"JPY", "jpy1", "ین", "🇯🇵"},
+	{"CNY", "cny1", "یوان", "🇨🇳"},
+	{"RUB", "rub1", "روبل", "🇷🇺"},
+	{"SEK", "sek1", "کرون سوئد", "🇸🇪"},
+	{"NOK", "nok1", "کرون نروژ", "🇳🇴"},
+	{"DKK", "dkk1", "کرون دانمارک", "🇩🇰"},
+	{"SGD", "sgd1", "دلار سنگاپور", "🇸🇬"},
+	{"HKD", "hkd1", "دلار هنگ‌کنگ", "🇭🇰"},
+	{"INR", "inr1", "روپیه", "🇮🇳"},
+	{"MYR", "myr1", "رینگیت", "🇲🇾"},
+	{"THB", "thb1", "بات", "🇹🇭"},
+	{"KRW", "krw1", "وون", "🇰🇷"},
+	{"AZN", "azn1", "منات آذربایجان", "🇦🇿"},
+	{"AMD", "amd1", "درام", "🇦🇲"},
+	{"GEL", "gel1", "لاری", "🇬🇪"},
+	{"IQD", "iqd1", "دینار عراق", "🇮🇶"},
+	{"AFN", "afn1", "افغانی", "🇦🇫"},
+	{"BHD", "bhd1", "دینار بحرین", "🇧🇭"},
+	{"OMR", "omr1", "ریال عمان", "🇴🇲"},
+	{"QAR", "qar1", "ریال قطر", "🇶🇦"},
+	{"KWD", "kwd1", "دینار کویت", "🇰🇼"},
 }
 
 // parseBonbastFloat یک فیلد پاسخ bonbast (که معمولاً string با کاما) را به float
@@ -491,6 +498,16 @@ func fetchFiatRates(ctx context.Context, baseClient *http.Client) (float64, map[
 	}
 	param := string(m[1])
 
+	// استخراج ضریب واحد هر ارز از <sup class="miladi">N</sup> در HTML
+	perUnit := make(map[string]float64)
+	for _, sm := range bonbastPerUnitRe.FindAllSubmatch(html, -1) {
+		v, err := strconv.ParseFloat(string(sm[2]), 64)
+		if err != nil || v <= 0 {
+			continue
+		}
+		perUnit[string(sm[1])] = v
+	}
+
 	form := url.Values{}
 	form.Set("param", param)
 	jsonReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://www.bonbast.com/json", strings.NewReader(form.Encode()))
@@ -543,11 +560,11 @@ func fetchFiatRates(ctx context.Context, baseClient *http.Client) (float64, map[
 			log.Printf("⚠️ نرخ %s در پاسخ bonbast نامعتبر: %v", f.Symbol, raw)
 			continue
 		}
-		perUnit := f.PerUnit
-		if perUnit <= 0 {
-			perUnit = 1
+		divisor := perUnit[f.Symbol]
+		if divisor <= 0 {
+			divisor = 1
 		}
-		fiat[f.Symbol] = v / perUnit
+		fiat[f.Symbol] = v / divisor
 	}
 
 	return usdToman, fiat, nil
