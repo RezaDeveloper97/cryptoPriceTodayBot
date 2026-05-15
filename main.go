@@ -1383,7 +1383,7 @@ func formatAmount(v float64, sym string) string {
 
 func formatConvertReply(amount float64, fromSym string, result float64, toSym string, rate float64) string {
 	return fmt.Sprintf(
-		"🔁 *تبدیل ارز*\n`%s %s`  →  `%s %s`\n\nنرخ: `1 %s ≈ %s %s`",
+		"🔁 *تبدیل ارز*\n`%s %s`  →  `%s %s`\n\nنرخ:\n`1 %s ≈ %s %s`",
 		formatAmount(amount, fromSym), fromSym,
 		formatAmount(result, toSym), toSym,
 		fromSym,
