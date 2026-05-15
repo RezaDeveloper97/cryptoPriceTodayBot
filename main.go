@@ -460,7 +460,7 @@ func fetchUSDInToman(ctx context.Context, baseClient *http.Client) (float64, err
 // formatMessage پیام نهایی Markdown را می‌سازد
 func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 	var b strings.Builder
-	b.WriteString("📊 *Live Crypto Prices*\n")
+	b.WriteString("📊 Live Crypto Prices\n")
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 
 	for _, c := range coins {
@@ -468,25 +468,25 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 		if !ok {
 			continue
 		}
-		sign := "🟢 ▲"
+		sign := "🟢"
 		if p.Change24h < 0 {
-			sign = "🔴 ▼"
+			sign = "🔴"
 		}
 		fmt.Fprintf(&b,
-			"%s *%s* `%s`\n   `$%s`  %s `%+.2f%%`\n",
-			c.Emoji, c.Name, c.Symbol,
-			formatPrice(p.USD), sign, p.Change24h,
+			"%s %s · $%s · %+.2f%%\n",
+			sign, c.Symbol,
+			formatPrice(p.USD), p.Change24h,
 		)
 	}
 
 	b.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 	if usdToman > 0 {
 		fmt.Fprintf(&b,
-			"🇮🇷 *IRR* `1 USD ≈ %s Toman`\n",
+			"💵 1 USD ≈ %s Toman\n",
 			addThousandsSep(fmt.Sprintf("%.0f", usdToman)),
 		)
 	} else {
-		b.WriteString("🇮🇷 *IRR* _unavailable_\n")
+		b.WriteString("💵 USD/IRR unavailable\n")
 	}
 
 	// زمان به وقت تهران
@@ -495,8 +495,8 @@ func formatMessage(prices map[string]priceInfo, usdToman float64) string {
 		loc = time.UTC
 	}
 	fmt.Fprintf(&b,
-		"🕐 %s (Tehran)\n_Sources: CoinGecko · Nobitex_",
-		time.Now().In(loc).Format("2006-01-02 15:04:05"),
+		"🕐 %s (Tehran)",
+		time.Now().In(loc).Format("2006-01-02 15:04"),
 	)
 	return b.String()
 }
